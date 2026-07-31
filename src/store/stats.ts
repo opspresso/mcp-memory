@@ -21,6 +21,13 @@
  * folded it died before deleting it, and even if two pods compact at once.
  * Deleting absorbed shards is therefore garbage collection, not correctness.
  *
+ * **And it trails, so a shard is never counted zero times either.** A key is
+ * stamped when the flush builds it, not when S3 accepts it, so a line drawn
+ * across everything currently visible can end up above a shard still in
+ * flight — which would then be dropped for good. Compaction therefore only
+ * absorbs shards older than `COMPACTION_LAG_MS`, which holds for any write that
+ * lands within that of being stamped, clock skew included.
+ *
  * What this gives up, deliberately: a pod that dies before its next flush takes
  * up to `flushMs` of counts with it. Counters feed ranking and nothing else, so
  * the cost is that a memory sits a little lower for a while. Paying for exactness
@@ -28,7 +35,7 @@
  * this design exists to avoid.
  */
 
-import { ulid } from "../id.js";
+import { ulid, ulidTime } from "../id.js";
 import { logError } from "../log.js";
 import { EMPTY_STATS, type MemoryStats } from "../types.js";
 import { PreconditionFailed, type ObjectStore } from "./objects.js";
@@ -53,6 +60,33 @@ const EMPTY_MERGED: Merged = { counts: {}, watermark: "" };
  * that is its own outage.
  */
 const SHARD_READ_BATCH = 16;
+
+/**
+ * How long a shard must have existed before compaction may absorb it.
+ *
+ * The watermark stops a shard being counted twice. On its own it does not stop
+ * one being counted *never*, and that is a real hole rather than a theoretical
+ * one: a shard's key is stamped when the flush builds it, not when S3 accepts
+ * it. A compaction that lists between those two moments sets a watermark above
+ * a shard that has not landed yet, and when it does land it is already below
+ * the line — its counts are dropped, and the object sits in the prefix forever,
+ * listed on every read and absorbed by nothing.
+ *
+ * Clock skew is what turns that race into a pattern. Each pod stamps ULIDs from
+ * its own clock, so a pod running behind produces keys that sort low against
+ * everyone else's, and can lose most of what it flushes rather than the
+ * occasional one.
+ *
+ * So the watermark trails: shards younger than this are still counted, but the
+ * line is not drawn past them. It only has to exceed the worst clock skew plus
+ * the slowest PUT, and a minute is far more than either.
+ */
+const COMPACTION_LAG_MS = 60_000;
+
+/** The instant a shard's name encodes, or NaN when it is not shaped like one. */
+function shardTime(key: string): number {
+  return ulidTime(shardOrder(key).slice(0, 26));
+}
 
 export interface StatsOptions {
   podId: string;
@@ -223,31 +257,54 @@ export class StatsTracker {
     const shardKeys = await this.store.list(shardPrefix(tenant));
     const fresh = shardKeys.filter((key) => shardOrder(key) > merged.value.watermark);
 
-    const counts: Delta = {};
-    addInto(counts, merged.value.counts);
     // Fetched in batches rather than one at a time. This runs on the critical
     // path of every recall whose cache has expired, and a shard is a few
     // hundred bytes — so serialising the round trips spent most of a recall's
     // latency waiting, once per shard, for nothing that depended on the last
     // one. Order does not matter here: counts add and timestamps take the
     // later, which is the whole reason this merge converges.
+    const deltas = new Map<string, Delta>();
     for (let i = 0; i < fresh.length; i += SHARD_READ_BATCH) {
-      const batch = await Promise.all(
-        fresh.slice(i, i + SHARD_READ_BATCH).map((key) => this.store.get(key)),
-      );
-      for (const object of batch) {
+      const slice = fresh.slice(i, i + SHARD_READ_BATCH);
+      const batch = await Promise.all(slice.map((key) => this.store.get(key)));
+      batch.forEach((object, at) => {
         if (object) {
-          addInto(counts, parseDelta(object.body));
+          deltas.set(slice[at]!, parseDelta(object.body));
         }
+      });
+    }
+
+    const counts: Delta = {};
+    addInto(counts, merged.value.counts);
+    for (const key of fresh) {
+      const delta = deltas.get(key);
+      if (delta) {
+        addInto(counts, delta);
       }
     }
 
     this.cache.set(tenant, { counts, at: this.now() });
 
-    if (fresh.length > this.options.compactThreshold) {
+    // Only shards old enough that nothing can still land beneath them are
+    // absorbed — see `COMPACTION_LAG_MS`. The younger ones are counted above
+    // and left where they are, so they must not go into `merged.json` too:
+    // they stay above the watermark, and adding them here would count them
+    // again on the next read.
+    const settled = this.now() - COMPACTION_LAG_MS;
+    const absorbable = fresh.filter((key) => shardTime(key) <= settled);
+
+    if (absorbable.length > this.options.compactThreshold) {
+      const absorbed: Delta = {};
+      addInto(absorbed, merged.value.counts);
+      for (const key of absorbable) {
+        const delta = deltas.get(key);
+        if (delta) {
+          addInto(absorbed, delta);
+        }
+      }
       // Best effort, and deliberately not awaited into the caller's latency:
       // whoever loses the compare-and-swap simply did not need to win it.
-      this.compaction = this.compact(tenant, merged.etag, counts, fresh)
+      this.compaction = this.compact(tenant, merged.etag, absorbed, absorbable)
         .catch((error: unknown) => {
           // Losing the compare-and-swap is not an error and returns normally,
           // so anything arriving here is the store itself failing. Harmless

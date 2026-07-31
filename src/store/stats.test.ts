@@ -8,11 +8,14 @@
 
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
+import { ulid } from "../id.js";
 import { InMemoryObjectStore } from "../testing/fakes.js";
 import { StatsTracker } from "./stats.js";
 
 const TENANT = "demo";
 const START = Date.parse("2026-07-01T00:00:00.000Z");
+/** Comfortably past `COMPACTION_LAG_MS`, after which a shard may be absorbed. */
+const SETTLED = 120_000;
 
 function tracker(store: InMemoryObjectStore, podId: string, overrides: Partial<{ compactThreshold: number; cacheTtlMs: number; now: () => number }> = {}) {
   return new StatsTracker(store, {
@@ -106,6 +109,7 @@ describe("StatsTracker", () => {
       clock += 1000;
     }
 
+    clock += SETTLED; // compaction only absorbs shards past the lag
     const compactor = tracker(store, "compactor", { compactThreshold: 3, now: () => clock });
     assert.equal((await compactor.load(TENANT)).get("m1")?.accessCount, 5);
     await compactor.settled();
@@ -132,6 +136,7 @@ describe("StatsTracker", () => {
     const shards = await store.list(`stats/${TENANT}/shard/`);
     const bodies = await Promise.all(shards.map(async (key) => [key, (await store.get(key))!.body] as const));
 
+    clock += SETTLED;
     const first = tracker(store, "c1", { compactThreshold: 2, now: () => clock });
     await first.load(TENANT);
     await first.settled();
@@ -153,6 +158,7 @@ describe("StatsTracker", () => {
       clock += 1000;
     }
 
+    clock += SETTLED;
     const loser = tracker(store, "loser", { compactThreshold: 2, now: () => clock });
     const durable = loser.load(TENANT);
     // Another pod gets there first, changing the ETag the loser is holding.
@@ -189,6 +195,58 @@ describe("StatsTracker", () => {
     }
 
     assert.equal(await totalFor(store, "m1"), 40);
+  });
+
+  it("counts a shard that lands beneath an already-drawn watermark", async () => {
+    // The hole the lag exists to close. A shard's key is stamped when the flush
+    // builds it, not when S3 accepts it, so a compaction can draw the line
+    // above one that has not landed. Clock skew makes it a pattern rather than
+    // a race: a pod running behind mints low keys every time.
+    const store = new InMemoryObjectStore();
+    const shard = (at: number, pod: string) =>
+      store.put(
+        `stats/${TENANT}/shard/${ulid(at)}-${pod}.json`,
+        JSON.stringify({ m1: { access: 1, lastAt: new Date(at).toISOString() } }),
+      );
+
+    // Two shards land on time, 70s apart.
+    await shard(START, "pod-a");
+    await shard(START + 70_000, "pod-b");
+
+    // A third was stamped at +65s by a pod running slightly behind, and its PUT
+    // is still in flight — 53s late, inside the lag and so inside the promise.
+    const compactor = tracker(store, "c", { compactThreshold: 0, now: () => START + 118_000 });
+    await compactor.load(TENANT);
+    await compactor.settled();
+
+    // Absorbing everything visible would put the line at +70s, and this shard
+    // would arrive underneath it and never be counted again.
+    await shard(START + 65_000, "pod-behind");
+
+    assert.equal(await totalFor(store, "m1"), 3, "the late shard must still be counted");
+  });
+
+  it("counts a young shard without drawing the line past it", async () => {
+    const store = new InMemoryObjectStore();
+    let clock = START;
+    const pod = tracker(store, "pod-a", { now: () => clock });
+    for (let i = 0; i < 4; i++) {
+      pod.record(TENANT, "m1");
+      await pod.flush();
+      clock += 1000;
+    }
+
+    // Threshold met, but every shard is younger than the lag.
+    const eager = tracker(store, "eager", { compactThreshold: 1, now: () => clock });
+    assert.equal((await eager.load(TENANT)).get("m1")?.accessCount, 4, "counted all the same");
+    await eager.settled();
+
+    assert.equal(
+      (await store.list(`stats/${TENANT}/shard/`)).length,
+      4,
+      "and left in place until they have settled",
+    );
+    assert.equal(await totalFor(store, "m1"), 4, "with no double counting from the merged copy");
   });
 
   it("keeps tenants apart", async () => {

@@ -43,6 +43,13 @@ The watermark is what makes that safe: a shard is never counted twice, even if
 the pod that folded it died before deleting it, and even if two pods compact at
 once. Deleting absorbed shards is garbage collection, not correctness.
 
+It also trails by a minute, which is what stops a shard being counted *zero*
+times. A key is stamped when the flush builds it rather than when S3 accepts
+it, so a line drawn across everything currently visible can land above a write
+still in flight — and a pod whose clock runs behind mints low keys every time,
+turning that race into a pattern. Only shards older than the lag are absorbed,
+so any write that lands within a minute of being stamped is still counted.
+
 ```
 s3://<VECTOR_BUCKET>/                      (S3 Vectors)
   index "memories"                          key: <tenant>#<ulid>
