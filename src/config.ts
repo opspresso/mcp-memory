@@ -20,14 +20,18 @@ export interface Config {
   /** S3 Vectors bucket holding the memories themselves. */
   vectorBucket: string;
   vectorIndex: string;
-  /** Ordinary S3 bucket holding counters, the recency index, hot views and oversized bodies. */
+  /** Ordinary S3 bucket holding the access counters and the recency index. */
   stateBucket: string;
   embedding: EmbeddingConfig;
   /**
    * The cosine similarity below which a hit is not relevant to the query at all.
    *
-   * The only model-specific number in the system, and configurable for exactly
-   * that reason. Measured on Titan v2 (normalised, 1024d): a correct answer
+   * The only model-specific number a deployment configures, and configurable
+   * for exactly that reason. It is not quite the only one that exists: dedup in
+   * `service.ts` compares against a compiled-in cosine too, which is why it
+   * takes a model-independent second opinion before it acts on it.
+   *
+   * Measured on Titan v2 (normalised, 1024d): a correct answer
    * scores 0.15–0.41, an unrelated one under 0.05. A model whose correct
    * answers sit at 0.8 needs this raised to match, or every query looks
    * relevant; one whose scores are lower needs it dropped, or none do.
@@ -69,14 +73,22 @@ function required(env: NodeJS.ProcessEnv, name: string): string {
   return value;
 }
 
+/**
+ * A cosine threshold, in (0, 1].
+ *
+ * Zero is refused rather than accepted. A floor of zero admits every hit, and
+ * confidence is expressed as a multiple of the floor — so every result, however
+ * remote, would come back to the model labelled HIGH CONFIDENCE. A setting that
+ * makes the server confidently wrong should stop the rollout, not survive it.
+ */
 function ratio(env: NodeJS.ProcessEnv, name: string, fallback: number): number {
   const raw = env[name]?.trim();
   if (!raw) {
     return fallback;
   }
   const value = Number(raw);
-  if (!Number.isFinite(value) || value < 0 || value > 1) {
-    throw new ConfigError(`${name} must be between 0 and 1, got "${raw}"`);
+  if (!Number.isFinite(value) || value <= 0 || value > 1) {
+    throw new ConfigError(`${name} must be greater than 0 and at most 1, got "${raw}"`);
   }
   return value;
 }

@@ -29,6 +29,7 @@
  */
 
 import { ulid } from "../id.js";
+import { logError } from "../log.js";
 import { EMPTY_STATS, type MemoryStats } from "../types.js";
 import { PreconditionFailed, type ObjectStore } from "./objects.js";
 
@@ -92,7 +93,11 @@ function addInto(target: Delta, source: Delta): void {
 }
 
 function parseDelta(body: string): Delta {
-  const raw: unknown = JSON.parse(body);
+  return coerceDelta(JSON.parse(body));
+}
+
+/** The validation half, taking parsed JSON — `merged.json` already has its counts in hand. */
+function coerceDelta(raw: unknown): Delta {
   if (!raw || typeof raw !== "object") {
     return {};
   }
@@ -102,7 +107,14 @@ function parseDelta(body: string): Delta {
       continue;
     }
     const entry = value as { access?: unknown; lastAt?: unknown };
-    if (typeof entry.access === "number" && typeof entry.lastAt === "string") {
+    // `lastAt` has to parse, not merely be a string: it is fed to `Date.parse`
+    // on the recall path, and a NaN from there scrambles the ranking of every
+    // memory in the result set, not just this one. See `ranking.ts`.
+    if (
+      typeof entry.access === "number" &&
+      typeof entry.lastAt === "string" &&
+      Number.isFinite(Date.parse(entry.lastAt))
+    ) {
       out[id] = { access: entry.access, lastAt: entry.lastAt };
     }
   }
@@ -116,7 +128,7 @@ function parseMerged(body: string): Merged {
   }
   const value = raw as { counts?: unknown; watermark?: unknown };
   return {
-    counts: typeof value.counts === "object" && value.counts ? parseDelta(JSON.stringify(value.counts)) : {},
+    counts: coerceDelta(value.counts),
     watermark: typeof value.watermark === "string" ? value.watermark : "",
   };
 }
@@ -216,7 +228,12 @@ export class StatsTracker {
       // Best effort, and deliberately not awaited into the caller's latency:
       // whoever loses the compare-and-swap simply did not need to win it.
       this.compaction = this.compact(tenant, merged.etag, counts, fresh)
-        .catch(() => {})
+        .catch((error: unknown) => {
+          // Losing the compare-and-swap is not an error and returns normally,
+          // so anything arriving here is the store itself failing. Harmless
+          // once — shards keep piling up if it is not.
+          logError("stats_compaction_failed", error, { tenant });
+        })
         .finally(() => {
           this.compaction = undefined;
         });
@@ -258,7 +275,9 @@ export class StatsTracker {
     }
     // Garbage collection, not correctness: the watermark already excludes these
     // from every future read, so a failure here costs storage and nothing else.
-    await this.store.delete(absorbed).catch(() => {});
+    await this.store.delete(absorbed).catch((error: unknown) => {
+      logError("stats_shard_cleanup_failed", error, { tenant });
+    });
   }
 
   /** Write this pod's accumulated deltas as new shards and clear them. */
@@ -284,7 +303,11 @@ export class StatsTracker {
       return;
     }
     this.timer = setInterval(() => {
-      void this.flush().catch(() => {});
+      void this.flush().catch((error: unknown) => {
+        // The counts in that flush are gone, which the design accepts. What it
+        // does not accept is nobody knowing it keeps happening.
+        logError("stats_flush_failed", error);
+      });
     }, this.options.flushMs);
     // Never hold the process open for a counter flush.
     this.timer.unref?.();
@@ -296,6 +319,8 @@ export class StatsTracker {
       clearInterval(this.timer);
       this.timer = undefined;
     }
-    await this.flush().catch(() => {});
+    await this.flush().catch((error: unknown) => {
+      logError("stats_final_flush_failed", error);
+    });
   }
 }

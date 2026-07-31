@@ -118,6 +118,17 @@ export function toMetadata(memory: StoredMemory): Record<string, MetadataValue> 
  * deploy, and a record missing a field it did not used to have should sink in
  * the ranking, not fail the whole query.
  */
+/**
+ * A timestamp only if it is one.
+ *
+ * A string that will not parse is no more usable than a missing field, and is
+ * worse than one: it survives a type check and becomes NaN in the ranking. See
+ * `daysBetween` in `ranking.ts` for what that does to a result set.
+ */
+function readTimestamp(value: unknown): string | undefined {
+  return typeof value === "string" && Number.isFinite(Date.parse(value)) ? value : undefined;
+}
+
 export function fromMetadata(key: string, metadata: unknown): StoredMemory | undefined {
   if (!metadata || typeof metadata !== "object") {
     return undefined;
@@ -137,7 +148,7 @@ export function fromMetadata(key: string, metadata: unknown): StoredMemory | und
     memoryType: isMemoryType(raw.memoryType) ? raw.memoryType : "project",
     category: typeof raw.category === "string" ? raw.category : undefined,
     tags: Array.isArray(raw.tags) ? raw.tags.filter((t): t is string => typeof t === "string") : [],
-    createdAt: typeof raw.createdAt === "string" ? raw.createdAt : new Date(0).toISOString(),
+    createdAt: readTimestamp(raw.createdAt) ?? new Date(0).toISOString(),
     trustBase: typeof raw.trustBase === "number" ? raw.trustBase : 1,
   };
 }

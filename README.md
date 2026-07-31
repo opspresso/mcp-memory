@@ -5,7 +5,7 @@ An MCP server that gives an Agent Studio project a memory that outlives a run.
 | Tool | Takes | Returns |
 |---|---|---|
 | `recall(query, limit?, mode?)` | a question in natural language | matching memories, ranked, with a confidence level |
-| `remember(content, type?, category?, tags?)` | a fact worth keeping | the id it was stored under, or the one it merged into |
+| `remember(content, type?, category?, tags?)` | a fact worth keeping | the id it was stored under, or the existing one that already said it |
 | `list_memories(type?, limit?)` | — | this project's memories, newest first |
 | `forget(id)` | an id from `recall` | confirmation, or that no such memory exists |
 | `memory_stats()` | — | how many memories there are, by type |
@@ -139,9 +139,30 @@ correct answers sit at 0.8 needs this raised to match. To recalibrate: embed a
 handful of queries you know the answers to, plus a few you know are absent, and
 put the floor between the two clusters.
 
-Nothing else is model-specific. Which results come back above the floor is
-decided by a *fraction of the top match*, and the ranking scales similarity the
-same way, so both survive a model swap untouched.
+Ranking survives a model swap untouched. Which results come back above the floor
+is decided by a *fraction of the top match*, and the composite scales similarity
+the same way, so neither carries an absolute cosine.
+
+### The other cosine, and why it is not configurable
+
+`remember` treats a new memory as already known above **0.92**, which on the
+table above sits between the same fact reworded and the same fact with a typo —
+so only near-verbatim repetition merges. That number is compiled in, not an
+environment variable, and the reason is worth stating because it cuts against
+the floor above.
+
+Declining to write is *silent*: the caller is told the fact is already known,
+and the fact is never stored. A knob that guards a silent failure is a knob
+nobody knows to turn — an operator tunes the recall floor because bad recall is
+visible, but nothing shows them a memory that was never written. So dedup does
+not rely on the cosine alone. It also requires the two texts to share half their
+words, which no embedding model gets a vote on: under a model whose
+similarities are compressed into a narrow band, two unrelated facts can clear
+0.92, and the wording is what stops them merging.
+
+The consequence is that a model swap does not require re-measuring this the way
+it requires re-measuring the floor. The failure it can still produce is a
+duplicate rather than a lost memory, which is the direction worth failing in.
 
 ### Authentication has two modes
 
@@ -205,12 +226,24 @@ static headers, so the finest grain available is the project.
 
 ## Run
 
-    VECTOR_BUCKET=… STATE_BUCKET=… EMBEDDING_BASE_URL=… EMBEDDING_API_KEY=… node dist/main.js
+Bedrock, the default — the pod's role covers the embeddings, so there is nothing
+else to pass:
+
+    VECTOR_BUCKET=… STATE_BUCKET=… node dist/main.js
+
+An OpenAI-compatible endpoint instead. `EMBEDDING_PROVIDER` is what selects it;
+without that the other two are read by nobody and the process still calls
+Bedrock:
+
+    EMBEDDING_PROVIDER=openai EMBEDDING_BASE_URL=… EMBEDDING_API_KEY=… \
+      VECTOR_BUCKET=… STATE_BUCKET=… node dist/main.js
 
     POST /mcp      JSON-RPC; Authorization: Bearer <MCP_API_KEY> when a key is set
     GET  /health   liveness
 
 AWS credentials come from the pod's role. Never bake keys into the image.
+Failures that reach a tool are also written to stderr as one JSON line each, so
+an outage shows up in the pod's logs and not only inside somebody's agent run.
 
 ## Develop
 

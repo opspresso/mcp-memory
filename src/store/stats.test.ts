@@ -166,6 +166,16 @@ describe("StatsTracker", () => {
     assert.equal(remaining.length, 4);
   });
 
+  it("hands back an untouched-memory reading nobody can corrupt", async () => {
+    // The same object is returned for every memory nobody has used, so a
+    // caller that mutated it would rewrite what all the others read.
+    const empty = StatsTracker.statsFor(new Map(), "never-used");
+    assert.equal(empty.accessCount, 0);
+    assert.throws(() => {
+      empty.accessCount = 99;
+    }, TypeError);
+  });
+
   it("keeps tenants apart", async () => {
     const store = new InMemoryObjectStore();
     const pod = tracker(store, "pod-a");
@@ -195,6 +205,24 @@ describe("StatsTracker", () => {
 
     clock += 60_000;
     assert.equal((await reader.load(TENANT)).get("m1")?.accessCount, 2, "cache expired");
+  });
+
+  it("drops a counter whose timestamp will not parse", async () => {
+    // `lastAt` is fed to `Date.parse` on the recall path, and a NaN from there
+    // does not sink one memory — it scrambles the ranking of every memory in
+    // the result set. A shard entry that cannot be read is dropped instead.
+    const store = new InMemoryObjectStore();
+    await store.put(
+      `stats/${TENANT}/shard/${"0".repeat(26)}-pod-x.json`,
+      JSON.stringify({
+        m1: { access: 3, lastAt: "not-a-date" },
+        m2: { access: 2, lastAt: new Date(START).toISOString() },
+      }),
+    );
+
+    const counts = await tracker(store, "reader").load(TENANT);
+    assert.equal(counts.get("m1"), undefined, "an unreadable timestamp is not a usable counter");
+    assert.equal(counts.get("m2")?.accessCount, 2, "its neighbours in the same shard still land");
   });
 
   it("survives merged state it cannot parse", async () => {

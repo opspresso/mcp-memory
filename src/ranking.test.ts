@@ -9,6 +9,7 @@ import {
   modeConfig,
   recencyScore,
   relativeSimilarity,
+  relativeStanding,
 } from "./ranking.js";
 
 const NOW = Date.parse("2026-07-01T00:00:00.000Z");
@@ -46,6 +47,51 @@ describe("decayedTrust", () => {
   it("never lets use push trust above where it started", () => {
     assert.equal(decayedTrust(NOW, 1, NOW, "pattern", 10_000), 1);
     assert.ok(decayedTrust(NOW, 0.5, NOW, "pattern", 10_000) <= 0.5);
+  });
+});
+
+describe("an unreadable timestamp", () => {
+  // A NaN score does not misplace one result — a comparator that returns NaN
+  // abandons the sort, so a single unparseable timestamp leaves the whole
+  // result set in arbitrary order. Every score has to stay a number.
+  const unreadable = Date.parse("not-a-date");
+
+  it("scores as finite rather than NaN", () => {
+    assert.ok(Number.isFinite(recencyScore(NOW, unreadable)));
+    assert.ok(Number.isFinite(decayedTrust(NOW, 1, unreadable, "project", 0)));
+    assert.ok(
+      Number.isFinite(
+        compositeScore("balanced", {
+          similarity: 1,
+          recency: recencyScore(NOW, unreadable),
+          access: 0,
+          trust: decayedTrust(NOW, 1, unreadable, "project", 0),
+        }),
+      ),
+    );
+  });
+
+  it("sinks the record it belongs to rather than lifting it", () => {
+    assert.equal(recencyScore(NOW, unreadable), 0);
+    assert.equal(decayedTrust(NOW, 1, unreadable, "project", 0), 0);
+  });
+
+  it("cannot break the ordering of the memories around it", () => {
+    const scored = [
+      { id: "weak", score: compositeScore("balanced", { similarity: 0.2, recency: 0, access: 0, trust: 0 }) },
+      {
+        id: "broken",
+        score: compositeScore("balanced", {
+          similarity: 0.5,
+          recency: recencyScore(NOW, unreadable),
+          access: 0,
+          trust: decayedTrust(NOW, 1, unreadable, "project", 0),
+        }),
+      },
+      { id: "best", score: compositeScore("balanced", { similarity: 1, recency: 1, access: 1, trust: 1 }) },
+    ];
+    scored.sort((a, b) => b.score - a.score);
+    assert.equal(scored[0]?.id, "best", "the best match must still sort first");
   });
 });
 
@@ -108,6 +154,35 @@ describe("relativeSimilarity", () => {
     const better = { similarity: relativeSimilarity(0.4, 0.4), recency: 0, access: 0, trust: 1 };
     const fresher = { similarity: relativeSimilarity(0.15, 0.4), recency: 1, access: 0, trust: 1 };
     assert.ok(compositeScore("balanced", better) > compositeScore("balanced", fresher));
+  });
+});
+
+describe("relativeStanding", () => {
+  it("puts the top result at 1 and scales the rest against it", () => {
+    assert.equal(relativeStanding(0.9, 0.9), 1);
+    assert.equal(relativeStanding(0.45, 0.9), 0.5);
+    assert.equal(relativeStanding(0, 0.9), 0);
+  });
+
+  it("survives a set where nothing scored", () => {
+    assert.equal(relativeStanding(0, 0), 0);
+  });
+
+  it("cannot contradict the order the results are shown in", () => {
+    // The reason this is against the score and not the similarity: ranking is
+    // by score, so a similarity-derived figure can run backwards down the list
+    // whenever recency or use reorders two memories.
+    const parts = { similarity: 0.9, recency: 0, access: 0, trust: 1 };
+    const fresher = { similarity: 0.85, recency: 1, access: 1, trust: 1 };
+    const ranked = [compositeScore("balanced", fresher), compositeScore("balanced", parts)].sort(
+      (a, b) => b - a,
+    );
+    const standings = ranked.map((score) => relativeStanding(score, ranked[0]!));
+    assert.deepEqual(
+      [...standings].sort((a, b) => b - a),
+      standings,
+      "standing must fall monotonically down the displayed order",
+    );
   });
 });
 

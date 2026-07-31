@@ -12,9 +12,10 @@
  * and not an omission.
  */
 
+import { logError } from "./log.js";
 import { isMemoryType, isRecallMode, MEMORY_TYPES, type MemoryType } from "./types.js";
 import { MAX_CONTENT_BYTES } from "./store/vectors.js";
-import type { MemoryService } from "./service.js";
+import { STATS_SCAN_CAP, type MemoryService } from "./service.js";
 
 export interface ToolDefinition {
   name: string;
@@ -66,8 +67,9 @@ export const TOOLS: readonly ToolDefinition[] = [
       "Store something worth knowing in a later session. Use it for durable facts — an " +
       "architectural decision and its reason, a convention this project follows, a command " +
       "that turned out to be the right one. Do not use it for the current conversation's " +
-      "working state, which does not outlive the run. Near-identical content merges into the " +
-      "existing memory instead of creating a second copy.",
+      "working state, which does not outlive the run. Content near-identical to something " +
+      "already stored is not written a second time: you are told which memory already says " +
+      "it, and the tags and category you passed are discarded along with the rest.",
     inputSchema: {
       type: "object",
       properties: {
@@ -126,8 +128,8 @@ export const TOOLS: readonly ToolDefinition[] = [
   {
     name: "memory_stats",
     description:
-      "How many memories this project has, broken down by type. Counts are approximate — " +
-      "usage figures are aggregated in the background and lag by up to a minute.",
+      "How many memories this project has, broken down by type. Exact up to " +
+      `${STATS_SCAN_CAP} memories; past that the answer says so and reports a lower bound.`,
     inputSchema: { type: "object", properties: {} },
   },
 ];
@@ -258,8 +260,14 @@ export async function callTool(
     }
   } catch (error) {
     if (error instanceof ArgumentError) {
+      // The model's mistake, and it can see the message. Nothing for an
+      // operator to act on, so nothing goes to the log.
       return failure(`Error: ${error.message}`);
     }
+    // Everything else is a dependency failing. The model gets a sentence and
+    // moves on, which is right for the run and useless for whoever has to fix
+    // it — so it is said out loud here as well.
+    logError("tool_failed", error, { tenant, tool: name });
     return failure(
       `Error: the memory store could not complete this request — ${
         error instanceof Error ? error.message : String(error)

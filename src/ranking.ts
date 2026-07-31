@@ -33,7 +33,8 @@ const DAY_MS = 86_400_000;
  * 1024d), a correct answer scores 0.15–0.41 and an unrelated one scores under
  * 0.05 — so a threshold tuned for a model whose correct answers sit at 0.8
  * silently returns nothing at all. Ratios survive the swap; absolute numbers do
- * not, and the one absolute number left is isolated in `RECALL_MIN_SIMILARITY`.
+ * not, and the one absolute number left *in ranking* is isolated in
+ * `RECALL_MIN_SIMILARITY`. Dedup keeps one of its own — see `service.ts`.
  */
 interface ModeConfig {
   keepRatio: number;
@@ -95,8 +96,21 @@ export function modeConfig(mode: RecallMode = "balanced"): ModeConfig {
 /** Trust a memory starts with, by how it was come by. Manual entry is trusted; nothing else is yet. */
 export const TRUST_MANUAL = 1.0;
 
+/**
+ * Elapsed days — never negative, and never NaN.
+ *
+ * The NaN case costs more than it looks. A timestamp that will not parse
+ * reaches `sort`'s comparator as a NaN score, and a comparator that returns NaN
+ * does not merely misplace the one entry: the sort abandons its ordering and
+ * the *whole* result set comes back arbitrary. So an unreadable timestamp is
+ * treated as infinitely old, which sinks that record and leaves the rest alone.
+ */
 function daysBetween(now: number, then: number): number {
-  return Math.max(0, (now - then) / DAY_MS);
+  const elapsed = now - then;
+  if (!Number.isFinite(elapsed)) {
+    return Number.MAX_SAFE_INTEGER;
+  }
+  return Math.max(0, elapsed / DAY_MS);
 }
 
 /** 1.0 for something just touched, 0.5 at the half-life, decaying from there. */
@@ -149,6 +163,24 @@ export function relativeSimilarity(similarity: number, topSimilarity: number): n
   return topSimilarity <= 0 ? 0 : Math.min(1, similarity / topSimilarity);
 }
 
+/**
+ * A result's standing against the best in its own set, 0..1.
+ *
+ * What `recall` shows the model in place of a cosine. A raw similarity is the
+ * one thing in a result that does not survive a model swap — Titan's correct
+ * answers sit at 0.15–0.41, so "30% match" printed beside "HIGH CONFIDENCE"
+ * reads as a contradiction to the model, and means something else entirely
+ * under a model whose correct answers sit at 0.8.
+ *
+ * Against the *score* rather than the similarity, because ranking is by score:
+ * this is the only ratio that cannot contradict the order the model is looking
+ * at. A similarity-derived one can, since recency and use are free to reorder
+ * two memories whose distances run the other way.
+ */
+export function relativeStanding(score: number, topScore: number): number {
+  return topScore <= 0 ? 0 : Math.min(1, score / topScore);
+}
+
 export function compositeScore(
   mode: RecallMode,
   parts: { similarity: number; recency: number; access: number; trust: number },
@@ -194,6 +226,11 @@ export function guidanceFor(
     if (confidence === "high") {
       return "HIGH CONFIDENCE: use these directly — the top result closely matches the query.";
     }
+    // `low` cannot arrive here from `recall`: confidence is `low` only when
+    // there was no top similarity to judge, and that is the same condition as
+    // having no results. If some other caller ever manages it, medium is the
+    // right answer anyway — there are results, and hedging is what a caller
+    // that cannot vouch for them should be told to do.
     return (
       "MEDIUM CONFIDENCE: these are relevant but check they apply to the current context " +
       "before relying on them."

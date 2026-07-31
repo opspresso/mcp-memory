@@ -8,10 +8,16 @@
  */
 
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import type { AddressInfo } from "node:net";
 import { after, before, describe, it } from "node:test";
 import { loadConfig } from "./config.js";
-import { createMcpServer, PROTOCOL_VERSION, type ToolHandler } from "./server.js";
+import {
+  createMcpServer,
+  PROTOCOL_VERSION,
+  SERVER_VERSION,
+  type ToolHandler,
+} from "./server.js";
 
 const BASE_ENV = {
   VECTOR_BUCKET: "vectors",
@@ -87,6 +93,18 @@ describe("health", () => {
 
   it("404s anything that is not the endpoint", async () => {
     assert.equal((await fetch(`${instance.url}/nope`)).status, 404);
+  });
+});
+
+describe("what the server calls itself", () => {
+  it("reports the version in package.json", () => {
+    // Two copies of one number, and the handshake is where a stale one shows
+    // up — as a client being told it is talking to a release that shipped
+    // months ago. Nothing else notices, so this has to.
+    const manifest = JSON.parse(
+      readFileSync(new URL("../package.json", import.meta.url), "utf8"),
+    ) as { version: string };
+    assert.equal(SERVER_VERSION, manifest.version);
   });
 });
 
@@ -177,6 +195,33 @@ describe("transport", () => {
     });
     assert.equal(response.status, 400);
     assert.equal(errorOf((await response.json()) as JsonRpcReply).code, -32700);
+  });
+
+  it("reports an oversized body as too large, not as bad JSON", async () => {
+    // It parsed fine; it was never read. Calling that a parse error sends
+    // whoever is debugging it after the wrong thing.
+    const response = await fetch(`${instance.url}/mcp`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-memory-tenant": "demo" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list", pad: "x".repeat(2e6) }),
+    });
+    assert.equal(response.status, 413);
+    const error = errorOf((await response.json()) as JsonRpcReply);
+    assert.notEqual(error.code, -32700, "not a parse error");
+    assert.match(error.message, /exceeds/);
+  });
+
+  it("refuses a batch out loud rather than answering 202", async () => {
+    // An array carries no `id`, so the notification branch would take it for
+    // one and reply 202 — leaving the sender waiting on a response that is
+    // never coming.
+    const response = await fetch(`${instance.url}/mcp`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-memory-tenant": "demo" },
+      body: JSON.stringify([{ jsonrpc: "2.0", id: 1, method: "initialize" }]),
+    });
+    assert.equal(response.status, 400);
+    assert.match(errorOf((await response.json()) as JsonRpcReply).message, /batched requests/);
   });
 
   it("reports an unsupported method rather than hanging", async () => {
