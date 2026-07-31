@@ -8,7 +8,7 @@ An MCP server that gives an Agent Studio project a memory that outlives a run.
 | `remember(content, type?, category?, tags?)` | a fact worth keeping | the id it was stored under, or the existing one that already said it |
 | `list_memories(type?, limit?)` | — | this project's memories, newest first |
 | `forget(id)` | an id from `recall` | confirmation, or that no such memory exists |
-| `memory_stats()` | — | how many memories there are, by type |
+| `memory_stats()` | — | how many memories there are, by type; a lower bound past 10,000 |
 
 It exists because every run starts from nothing. An agent that decided something
 last week, or was told a convention, or worked out which command actually works,
@@ -110,12 +110,12 @@ Worth knowing before you rely on it:
 | `EMBEDDING_DIM` | `1024` | `1536` under `openai`. Must equal the index's dimension |
 | `EMBEDDING_BASE_URL` | — | **required under `openai`.** OpenAI-compatible base |
 | `EMBEDDING_API_KEY` | — | **required under `openai`** |
-| `RECALL_MIN_SIMILARITY` | `0.1` | relevance floor — model-specific, see below |
+| `RECALL_MIN_SIMILARITY` | `0.1` | relevance floor, in (0, 1] — model-specific, see below |
 | `AWS_REGION` | `ap-northeast-2` | |
 | `PORT` | `3000` | |
 | `MCP_API_KEY` | unset | when set, every request must present it as a bearer token |
 | `STATS_FLUSH_MS` | `30000` | how often a pod pushes its counters |
-| `STATS_COMPACT_THRESHOLD` | `20` | shard count past which a reader folds them in |
+| `STATS_COMPACT_THRESHOLD` | `20` | how many shards *older than the lag* it takes before a reader folds them in |
 
 All of it is validated before the port is bound, so a missing bucket name stops
 a rollout at the probe rather than surfacing inside somebody's agent run.
@@ -126,8 +126,8 @@ the vector bucket, which takes an internet round trip off every recall.
 
 ### Calibrating the relevance floor
 
-`RECALL_MIN_SIMILARITY` is the one number here that belongs to the embedding
-model rather than to this server, and getting it wrong is quiet in both
+`RECALL_MIN_SIMILARITY` is the one model-specific number a deployment sets —
+there is a second one compiled in, below — and getting it wrong is quiet in both
 directions: too high and every query answers "nothing is stored", too low and
 unrelated memories come back as weak matches.
 
@@ -145,6 +145,11 @@ Hence `0.1`. **These numbers do not transfer between models** — a model whose
 correct answers sit at 0.8 needs this raised to match. To recalibrate: embed a
 handful of queries you know the answers to, plus a few you know are absent, and
 put the floor between the two clusters.
+
+Zero is refused rather than accepted, and the process stops at boot if it is
+set. A floor of zero admits every hit, and confidence is expressed as a multiple
+of the floor — so every result, however remote, would reach the model labelled
+HIGH CONFIDENCE.
 
 Ranking survives a model swap untouched. Which results come back above the floor
 is decided by a *fraction of the top match*, and the composite scales similarity
@@ -170,6 +175,27 @@ similarities are compressed into a narrow band, two unrelated facts can clear
 The consequence is that a model swap does not require re-measuring this the way
 it requires re-measuring the floor. The failure it can still produce is a
 duplicate rather than a lost memory, which is the direction worth failing in.
+
+### What a single call may carry
+
+Compiled in rather than configurable, and written down here because a refused
+`remember` otherwise sends someone reading source:
+
+| | |
+|---|---|
+| `content` | 32,000 bytes |
+| `category` | 128 bytes |
+| `tags` | 20 entries, 64 bytes each |
+| `limit` on `recall` and `list_memories` | 1 – 50 |
+
+Bytes rather than characters, because the ceiling underneath them is measured
+that way: 40 KB of metadata per vector, of which the filterable half — where
+`category` lands — is 2 KB. All of it is checked before anything is sent, so a
+model that overshoots is told which field to shorten instead of getting a size
+back from AWS that names neither the field nor the limit.
+
+`memory_stats` has a ceiling of its own: it counts index keys and stops at
+10,000, past which it reports a lower bound and says so.
 
 ### Authentication has two modes
 
