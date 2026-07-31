@@ -31,9 +31,14 @@ export interface ShutdownOptions {
   /** How long to let in-flight requests finish before flushing anyway. */
   graceMs: number;
   exit: (code: number) => void;
-  /** Injected in tests; defaults to the global. */
+  /**
+   * Injected in tests; defaults to the global.
+   *
+   * A test supplies one whose handle has no `unref`, because the production
+   * timer is unref'd — right for a pod, and fatal for a test, where an empty
+   * event loop lets the process leave before the deadline it is asserting on.
+   */
   setTimer?: (handler: () => void, ms: number) => { unref?: () => void };
-  clearTimer?: (handle: never) => void;
 }
 
 /**

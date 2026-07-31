@@ -4,7 +4,7 @@
  */
 
 import assert from "node:assert/strict";
-import { describe, it } from "node:test";
+import { afterEach, describe, it } from "node:test";
 import { gracefulShutdown, type Closable, type Flushable } from "./shutdown.js";
 
 /** A server that closes when told to, or never — the two cases that matter. */
@@ -29,10 +29,33 @@ function counters(): Flushable & { flushes: number } {
   };
 }
 
+/**
+ * A deadline timer that holds the event loop open.
+ *
+ * Production unrefs its timer so a shutdown in progress can never be the reason
+ * the process lingers. A test needs the opposite: with nothing else pending,
+ * an unref'd deadline lets Node exit before it fires, and the test is cancelled
+ * rather than failed — which is how this passed locally, where other test files
+ * kept the loop busy, and died in CI.
+ */
+const pending: NodeJS.Timeout[] = [];
+const holdingTimer = (handler: () => void, ms: number) => {
+  pending.push(setTimeout(handler, ms));
+  return {}; // no `unref`, so `gracefulShutdown`'s optional call is a no-op
+};
+
+// Released afterwards, or a test that never reaches its deadline would hold the
+// suite open for the whole of it.
+afterEach(() => {
+  for (const timer of pending.splice(0)) {
+    clearTimeout(timer);
+  }
+});
+
 /** Resolves with the exit code the handler eventually calls. */
 function leaving(server: Closable, stats: Flushable, graceMs: number): Promise<number> {
   return new Promise((resolve) => {
-    gracefulShutdown(server, stats, { graceMs, exit: resolve })();
+    gracefulShutdown(server, stats, { graceMs, exit: resolve, setTimer: holdingTimer })();
   });
 }
 
@@ -77,6 +100,7 @@ describe("gracefulShutdown", () => {
       exit: () => {
         exits += 1;
       },
+      setTimer: holdingTimer,
     });
     leave();
     leave();
