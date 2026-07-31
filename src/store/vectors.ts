@@ -24,7 +24,7 @@ import {
   QueryVectorsCommand,
   S3VectorsClient,
 } from "@aws-sdk/client-s3vectors";
-import type { MemoryType, StoredMemory } from "../types.js";
+import type { StoredMemory } from "../types.js";
 import { isMemoryType } from "../types.js";
 
 /**
@@ -51,13 +51,14 @@ export interface VectorHit {
 
 export interface VectorStore {
   put(memory: StoredMemory, embedding: number[]): Promise<void>;
-  /** Nearest neighbours within one tenant, already converted to similarity. */
-  query(
-    tenantId: string,
-    embedding: number[],
-    topK: number,
-    memoryType?: MemoryType,
-  ): Promise<VectorHit[]>;
+  /**
+   * Nearest neighbours within one tenant, already converted to similarity.
+   *
+   * Returns at most one page, however large `topK` is — see
+   * `MAX_RESULTS_PER_PAGE`. No ordering is promised; callers that need the
+   * best hit must find it rather than take the first.
+   */
+  query(tenantId: string, embedding: number[], topK: number): Promise<VectorHit[]>;
   /** Fetch by id, for listing. Missing ids are dropped rather than erroring. */
   get(tenantId: string, ids: string[]): Promise<StoredMemory[]>;
   delete(tenantId: string, ids: string[]): Promise<void>;
@@ -72,10 +73,26 @@ export function vectorKey(tenantId: string, id: string): string {
   return `${tenantId}#${id}`;
 }
 
-/** Everything one vector's metadata may hold, filterable and not. */
+/**
+ * The service's own quotas, in bytes.
+ *
+ * AWS documents these as "40 KB" and "2 KB" without saying whether the K is
+ * 1000 or 1024. Taken as 1000, because being wrong in that direction refuses a
+ * memory the service would have accepted, and being wrong in the other lets
+ * through the rejection this check exists to pre-empt.
+ */
 const MAX_METADATA_BYTES = 40_000;
 /** The filterable half's own, much smaller ceiling. `category` is what can fill it. */
-const MAX_FILTERABLE_BYTES = 2_048;
+const MAX_FILTERABLE_BYTES = 2_000;
+/**
+ * Results one `QueryVectors` response can carry, whatever `topK` asked for.
+ *
+ * The rest come back behind a `nextToken` this store does not follow, so a
+ * `topK` above it would not raise an error — it would quietly return a prefix.
+ * Clamped rather than documented, so the truncation cannot be reintroduced by
+ * raising a constant somewhere else.
+ */
+const MAX_RESULTS_PER_PAGE = 100;
 
 /**
  * Refuse a memory the service would refuse, and say which part is too big.
@@ -217,21 +234,18 @@ export class S3VectorsStore implements VectorStore {
     );
   }
 
-  async query(
-    tenantId: string,
-    embedding: number[],
-    topK: number,
-    memoryType?: MemoryType,
-  ): Promise<VectorHit[]> {
+  async query(tenantId: string, embedding: number[], topK: number): Promise<VectorHit[]> {
     const response = await this.client.send(
       new QueryVectorsCommand({
         vectorBucketName: this.bucket,
         indexName: this.index,
-        topK,
+        topK: Math.min(topK, MAX_RESULTS_PER_PAGE),
         queryVector: { float32: embedding },
-        // The isolation boundary. Every read is filtered by the tenant the
-        // request's header named, and nothing else can widen it.
-        filter: memoryType ? { tenantId, memoryType } : { tenantId },
+        // The isolation boundary, and a single key on purpose: a bare value is
+        // documented as an implicit `$eq`, which is the one filter shape this
+        // server needs and the only one it exercises. Nothing here may widen
+        // it, and nothing untested sits on this line.
+        filter: { tenantId },
         returnMetadata: true,
         returnDistance: true,
       }),

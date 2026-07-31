@@ -300,8 +300,7 @@ describe("recall does not assume the store sorts", () => {
       put: (memory, embedding) => backing.put(memory, embedding),
       get: (t, ids) => backing.get(t, ids),
       delete: (t, ids) => backing.delete(t, ids),
-      query: async (t, embedding, topK, type) =>
-        (await backing.query(t, embedding, topK, type)).reverse(),
+      query: async (t, embedding, topK) => (await backing.query(t, embedding, topK)).reverse(),
     };
     const shuffled = new S3MemoryService(
       reversing,
