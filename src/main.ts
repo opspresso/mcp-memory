@@ -17,7 +17,16 @@ import { S3MemoryService } from "./service.js";
 import { createObjectStore } from "./store/objects.js";
 import { StatsTracker } from "./store/stats.js";
 import { createVectorStore } from "./store/vectors.js";
+import { gracefulShutdown } from "./shutdown.js";
 import { callTool, TOOLS } from "./tools.js";
+
+/**
+ * How long in-flight requests get before the counter flush runs regardless.
+ *
+ * Well inside Kubernetes' 30s default grace period: the point is to flush and
+ * exit on our own terms rather than to be SIGKILLed mid-drain.
+ */
+const SHUTDOWN_GRACE_MS = 10_000;
 
 let config;
 try {
@@ -81,12 +90,13 @@ server.listen(config.port, () => {
   }
 });
 
+// Counters are the only pod-local state worth saving, and a closed server is
+// what stops anything still incrementing them — but not at the price of never
+// flushing at all. See `shutdown.ts`.
+const leave = gracefulShutdown(server, stats, {
+  graceMs: SHUTDOWN_GRACE_MS,
+  exit: (code) => process.exit(code),
+});
 for (const signal of ["SIGTERM", "SIGINT"] as const) {
-  process.on(signal, () => {
-    // Counters first: the flush is the only pod-local state worth saving, and a
-    // closed server means nothing is still incrementing it.
-    server.close(() => {
-      void stats.stop().finally(() => process.exit(0));
-    });
-  });
+  process.on(signal, leave);
 }

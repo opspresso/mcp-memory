@@ -40,7 +40,12 @@ export interface MemoryStats {
   lastAccessedAt: string;
 }
 
-export const EMPTY_STATS: MemoryStats = { accessCount: 0, lastAccessedAt: "" };
+/**
+ * Shared, and frozen for that reason. `StatsTracker.statsFor` hands this same
+ * object back for every memory nobody has touched, so one caller mutating it
+ * would rewrite what all the others read.
+ */
+export const EMPTY_STATS: MemoryStats = Object.freeze({ accessCount: 0, lastAccessedAt: "" });
 
 /** A memory as `recall` ranks and returns it. */
 export interface RankedMemory extends StoredMemory {

@@ -14,6 +14,7 @@
 
 import type { Embedder } from "./embeddings.js";
 import { invertedTime, ulid, ulidTime } from "./id.js";
+import { logError } from "./log.js";
 import {
   accessScore,
   compositeScore,
@@ -23,6 +24,7 @@ import {
   modeConfig,
   recencyScore,
   relativeSimilarity,
+  relativeStanding,
   TRUST_MANUAL,
 } from "./ranking.js";
 import type { ObjectStore } from "./store/objects.js";
@@ -31,12 +33,36 @@ import type { VectorStore } from "./store/vectors.js";
 import type { MemoryType, RankedMemory, RecallMode, StoredMemory } from "./types.js";
 import { MEMORY_TYPES } from "./types.js";
 
-/** Above this cosine similarity, two memories are treated as the same fact. */
+/**
+ * Above this cosine, two memories are *candidates* for being the same fact.
+ *
+ * Not the whole test — see `wordOverlap`. Calibrated on Titan v2, where it sits
+ * between the same fact reworded (0.72) and the same fact with a typo (0.99),
+ * so only near-verbatim repetition merges.
+ */
 const DEDUP_THRESHOLD = 0.92;
+/**
+ * How much of the two texts' wording has to coincide before a high cosine is
+ * believed.
+ *
+ * Deliberately low. Distinct facts overlap near zero and a near-identical pair
+ * well above this, so the number only has to land in a wide gap — and landing
+ * low costs a duplicate, which is the cheap direction.
+ */
+const DEDUP_MIN_WORD_OVERLAP = 0.5;
 /** Candidates pulled per recall before re-ranking. One QueryVectors page. */
 const CANDIDATE_CAP = 100;
 /** Index keys fetched per listing round trip. S3's own maximum. */
 const PAGE_SIZE = 1000;
+/**
+ * Index keys `memory_stats` will scan before it stops.
+ *
+ * Counting by type means listing every key, so there has to be a stopping
+ * point. Past it the totals are a floor rather than a count, and the answer
+ * says so — a truncated number presented as exact is a wrong answer the caller
+ * has no way to notice.
+ */
+export const STATS_SCAN_CAP = 10_000;
 
 export interface RecallRequest {
   query: string;
@@ -89,14 +115,62 @@ function percent(value: number): string {
   return `${Math.round(value * 100)}%`;
 }
 
+/**
+ * Jaccard overlap of two texts' words, 0..1 — a second opinion on the cosine.
+ *
+ * It exists because the cosine is the *embedding model's* opinion, and
+ * `DEDUP_THRESHOLD` is calibrated for one model. On Titan a different fact from
+ * the same project scores 0.04–0.19 and cannot reach it; under a model whose
+ * similarities are compressed into a narrow band, two unrelated facts can. And
+ * declining is silent — the caller is told the fact is already known and it is
+ * never written — so that failure must not turn on a number belonging to a
+ * component the deployment is free to swap.
+ *
+ * Word overlap belongs to the texts instead. It cannot make dedup fire where
+ * the cosine did not; it can only stop it firing where the words disagree.
+ */
+function wordOverlap(a: string, b: string): number {
+  // Unicode classes rather than an ASCII range: this deployment mostly holds
+  // Korean, and a split that dropped it would score every pair at zero.
+  const wordsOf = (text: string) =>
+    new Set(
+      text
+        .toLowerCase()
+        .split(/[^\p{L}\p{N}]+/u)
+        .filter(Boolean),
+    );
+  const left = wordsOf(a);
+  const right = wordsOf(b);
+  if (left.size === 0 || right.size === 0) {
+    return 0;
+  }
+  let shared = 0;
+  for (const word of left) {
+    if (right.has(word)) {
+      shared += 1;
+    }
+  }
+  return shared / (left.size + right.size - shared);
+}
+
 function day(iso: string): string {
   return iso.slice(0, 10);
 }
 
-function render(memory: StoredMemory, position: number, similarity?: number): string {
+/**
+ * One memory as the model sees it.
+ *
+ * `standing` is a fraction of the top result's score, never a cosine. What a
+ * raw similarity means is a property of the embedding model rather than of the
+ * memory, so printing one hands the model a number it cannot calibrate — and
+ * one that contradicts the confidence line beside it, since on Titan a correct
+ * answer scores 0.15–0.41. How far a result sits below the best in its own set
+ * is the part that is true whatever the model.
+ */
+function render(memory: StoredMemory, position: number, standing?: number): string {
   const facets = [
     memory.category ? `${memory.memoryType}/${memory.category}` : memory.memoryType,
-    ...(similarity === undefined ? [] : [`${percent(similarity)} match`]),
+    ...(standing === undefined ? [] : [`${percent(standing)} of the top result`]),
     `stored ${day(memory.createdAt)}`,
   ];
   const tags = memory.tags.length > 0 ? `\n   tags: ${memory.tags.join(", ")}` : "";
@@ -145,7 +219,13 @@ export class S3MemoryService implements MemoryService {
     // absolute number can express — the same cosine means different things
     // depending on what else the query turned up.
     const relevant = hits.filter((hit) => hit.similarity >= this.minSimilarity);
-    const topSimilarity = relevant[0]?.similarity ?? 0;
+    // Math.max rather than `relevant[0]`: the store's contract is that these
+    // are the nearest neighbours, not that they arrive sorted. Understating the
+    // top does not tighten anything — it loosens everything. The ratio gate
+    // below becomes a fraction of a smaller number, so weak neighbours stop
+    // being gated out, and `relativeSimilarity` saturates at 1 for every hit at
+    // or above it, flattening the signal it exists to carry.
+    const topSimilarity = Math.max(...relevant.map((hit) => hit.similarity), 0);
     const keeping = relevant.filter(
       (hit) => hit.similarity >= topSimilarity * config.keepRatio,
     );
@@ -206,11 +286,18 @@ export class S3MemoryService implements MemoryService {
       ].join("\n");
     }
 
+    // No denominator on purpose. `hits.length` is the candidate neighbourhood
+    // this query pulled — 30 to 100 — and not how many memories the project
+    // has, but "5 of 30 memories" reads as the latter to the model that gets
+    // this line in its context, and it has nothing to check it against.
     return [
-      `[MEMORY] ${results.length} of ${hits.length} memories matched "${request.query}" (mode: ${mode}).`,
+      `[MEMORY] ${results.length} ${results.length === 1 ? "memory" : "memories"} matched ` +
+        `"${request.query}" (mode: ${mode}).`,
       guidanceFor(confidence, results.length, gated, mode),
       "",
-      ...results.map((memory, i) => render(memory, i + 1, memory.similarity)),
+      ...results.map((memory, i) =>
+        render(memory, i + 1, relativeStanding(memory.score, results[0]!.score)),
+      ),
     ].join("\n");
   }
 
@@ -221,12 +308,23 @@ export class S3MemoryService implements MemoryService {
     // stored memory is never rewritten, "merge" means declining to write and
     // pointing at what is already there — said plainly, so a model that meant
     // to record something new can tell that it did not.
+    // Two gates, and the second is not a refinement of the first. The cosine is
+    // the embedding model's judgement; the wording is the texts' own. Declining
+    // to write loses a fact silently, so it takes both.
     const [nearest] = await this.vectors.query(tenant, embedding, 1);
-    if (nearest && nearest.similarity >= DEDUP_THRESHOLD) {
+    if (
+      nearest &&
+      nearest.similarity >= DEDUP_THRESHOLD &&
+      wordOverlap(request.content, nearest.memory.content) >= DEDUP_MIN_WORD_OVERLAP
+    ) {
       this.stats_.record(tenant, nearest.memory.id, this.now());
+      // No percentage: the number that decided this is a cosine, and what a
+      // cosine means belongs to the embedding model rather than to the memory.
+      // That it was close enough to count as the same fact is the whole of what
+      // the model can act on.
       return (
-        `[MEMORY] Already known — this is ${percent(nearest.similarity)} the same as an existing ` +
-        `memory, so nothing new was written.\n\n${render(nearest.memory, 1)}`
+        `[MEMORY] Already known — an existing memory already says this, so nothing new ` +
+        `was written.\n\n${render(nearest.memory, 1)}`
       );
     }
 
@@ -325,8 +423,19 @@ export class S3MemoryService implements MemoryService {
     if (!existing) {
       return `[MEMORY] No memory with id ${id} exists for this project. Nothing was deleted.`;
     }
+    // The vector first, and the order is not arbitrary. Losing the vector is
+    // what makes the memory unreachable, which is what was asked for; the index
+    // entry is a listing artefact. Reversed, a failure would leave a memory the
+    // caller was told about as deleted still answering every recall.
     await this.vectors.delete(tenant, [id]);
-    await this.objects.delete([indexKey(tenant, existing)]);
+    // So the index entry is garbage collection, not correctness — and a failure
+    // here must not be reported as a failed deletion, because the deletion
+    // happened. What it leaves behind is a key that resolves to nothing:
+    // `list_memories` already drops those, and `memory_stats` counts one too
+    // many until someone removes it.
+    await this.objects.delete([indexKey(tenant, existing)]).catch((error: unknown) => {
+      logError("forget_index_cleanup_failed", error, { tenant, key: indexKey(tenant, existing) });
+    });
     // Counters for the deleted id are left behind. They are a few bytes inside
     // an object nothing will ever look up again, and removing them would mean a
     // compare-and-swap on the merged counters for no behavioural gain.
@@ -334,7 +443,7 @@ export class S3MemoryService implements MemoryService {
   }
 
   async stats(tenant: string): Promise<string> {
-    const keys = await this.objects.list(`index/${tenant}/`, 10_000);
+    const keys = await this.objects.list(`index/${tenant}/`, STATS_SCAN_CAP);
     const counts = new Map<string, number>();
     for (const key of keys) {
       const entry = parseIndexKey(key);
@@ -349,6 +458,12 @@ export class S3MemoryService implements MemoryService {
     const breakdown = MEMORY_TYPES.filter((type) => counts.has(type))
       .map((type) => `${type}: ${counts.get(type)}`)
       .join(", ");
+    if (keys.length >= STATS_SCAN_CAP) {
+      return (
+        `[MEMORY] At least ${total} memories for this project (${breakdown}). ` +
+        `Counting stopped at ${STATS_SCAN_CAP} keys, so every figure here is a lower bound.`
+      );
+    }
     return `[MEMORY] ${total} memories for this project (${breakdown}).`;
   }
 }

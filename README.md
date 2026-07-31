@@ -5,10 +5,10 @@ An MCP server that gives an Agent Studio project a memory that outlives a run.
 | Tool | Takes | Returns |
 |---|---|---|
 | `recall(query, limit?, mode?)` | a question in natural language | matching memories, ranked, with a confidence level |
-| `remember(content, type?, category?, tags?)` | a fact worth keeping | the id it was stored under, or the one it merged into |
+| `remember(content, type?, category?, tags?)` | a fact worth keeping | the id it was stored under, or the existing one that already said it |
 | `list_memories(type?, limit?)` | — | this project's memories, newest first |
 | `forget(id)` | an id from `recall` | confirmation, or that no such memory exists |
-| `memory_stats()` | — | how many memories there are, by type |
+| `memory_stats()` | — | how many memories there are, by type; a lower bound past 10,000 |
 
 It exists because every run starts from nothing. An agent that decided something
 last week, or was told a convention, or worked out which command actually works,
@@ -42,6 +42,13 @@ with a compare-and-swap and advances the watermark.
 The watermark is what makes that safe: a shard is never counted twice, even if
 the pod that folded it died before deleting it, and even if two pods compact at
 once. Deleting absorbed shards is garbage collection, not correctness.
+
+It also trails by a minute, which is what stops a shard being counted *zero*
+times. A key is stamped when the flush builds it rather than when S3 accepts
+it, so a line drawn across everything currently visible can land above a write
+still in flight — and a pod whose clock runs behind mints low keys every time,
+turning that race into a pattern. Only shards older than the lag are absorbed,
+so any write that lands within a minute of being stamped is still counted.
 
 ```
 s3://<VECTOR_BUCKET>/                      (S3 Vectors)
@@ -103,12 +110,12 @@ Worth knowing before you rely on it:
 | `EMBEDDING_DIM` | `1024` | `1536` under `openai`. Must equal the index's dimension |
 | `EMBEDDING_BASE_URL` | — | **required under `openai`.** OpenAI-compatible base |
 | `EMBEDDING_API_KEY` | — | **required under `openai`** |
-| `RECALL_MIN_SIMILARITY` | `0.1` | relevance floor — model-specific, see below |
+| `RECALL_MIN_SIMILARITY` | `0.1` | relevance floor, in (0, 1] — model-specific, see below |
 | `AWS_REGION` | `ap-northeast-2` | |
 | `PORT` | `3000` | |
 | `MCP_API_KEY` | unset | when set, every request must present it as a bearer token |
 | `STATS_FLUSH_MS` | `30000` | how often a pod pushes its counters |
-| `STATS_COMPACT_THRESHOLD` | `20` | shard count past which a reader folds them in |
+| `STATS_COMPACT_THRESHOLD` | `20` | how many shards *older than the lag* it takes before a reader folds them in |
 
 All of it is validated before the port is bound, so a missing bucket name stops
 a rollout at the probe rather than surfacing inside somebody's agent run.
@@ -119,8 +126,8 @@ the vector bucket, which takes an internet round trip off every recall.
 
 ### Calibrating the relevance floor
 
-`RECALL_MIN_SIMILARITY` is the one number here that belongs to the embedding
-model rather than to this server, and getting it wrong is quiet in both
+`RECALL_MIN_SIMILARITY` is the one model-specific number a deployment sets —
+there is a second one compiled in, below — and getting it wrong is quiet in both
 directions: too high and every query answers "nothing is stored", too low and
 unrelated memories come back as weak matches.
 
@@ -139,9 +146,56 @@ correct answers sit at 0.8 needs this raised to match. To recalibrate: embed a
 handful of queries you know the answers to, plus a few you know are absent, and
 put the floor between the two clusters.
 
-Nothing else is model-specific. Which results come back above the floor is
-decided by a *fraction of the top match*, and the ranking scales similarity the
-same way, so both survive a model swap untouched.
+Zero is refused rather than accepted, and the process stops at boot if it is
+set. A floor of zero admits every hit, and confidence is expressed as a multiple
+of the floor — so every result, however remote, would reach the model labelled
+HIGH CONFIDENCE.
+
+Ranking survives a model swap untouched. Which results come back above the floor
+is decided by a *fraction of the top match*, and the composite scales similarity
+the same way, so neither carries an absolute cosine.
+
+### The other cosine, and why it is not configurable
+
+`remember` treats a new memory as already known above **0.92**, which on the
+table above sits between the same fact reworded and the same fact with a typo —
+so only near-verbatim repetition merges. That number is compiled in, not an
+environment variable, and the reason is worth stating because it cuts against
+the floor above.
+
+Declining to write is *silent*: the caller is told the fact is already known,
+and the fact is never stored. A knob that guards a silent failure is a knob
+nobody knows to turn — an operator tunes the recall floor because bad recall is
+visible, but nothing shows them a memory that was never written. So dedup does
+not rely on the cosine alone. It also requires the two texts to share half their
+words, which no embedding model gets a vote on: under a model whose
+similarities are compressed into a narrow band, two unrelated facts can clear
+0.92, and the wording is what stops them merging.
+
+The consequence is that a model swap does not require re-measuring this the way
+it requires re-measuring the floor. The failure it can still produce is a
+duplicate rather than a lost memory, which is the direction worth failing in.
+
+### What a single call may carry
+
+Compiled in rather than configurable, and written down here because a refused
+`remember` otherwise sends someone reading source:
+
+| | |
+|---|---|
+| `content` | 32,000 bytes |
+| `category` | 128 bytes |
+| `tags` | 20 entries, 64 bytes each |
+| `limit` on `recall` and `list_memories` | 1 – 50 |
+
+Bytes rather than characters, because the ceiling underneath them is measured
+that way: 40 KB of metadata per vector, of which the filterable half — where
+`category` lands — is 2 KB. All of it is checked before anything is sent, so a
+model that overshoots is told which field to shorten instead of getting a size
+back from AWS that names neither the field nor the limit.
+
+`memory_stats` has a ceiling of its own: it counts index keys and stops at
+10,000, past which it reports a lower bound and says so.
 
 ### Authentication has two modes
 
@@ -205,12 +259,24 @@ static headers, so the finest grain available is the project.
 
 ## Run
 
-    VECTOR_BUCKET=… STATE_BUCKET=… EMBEDDING_BASE_URL=… EMBEDDING_API_KEY=… node dist/main.js
+Bedrock, the default — the pod's role covers the embeddings, so there is nothing
+else to pass:
+
+    VECTOR_BUCKET=… STATE_BUCKET=… node dist/main.js
+
+An OpenAI-compatible endpoint instead. `EMBEDDING_PROVIDER` is what selects it;
+without that the other two are read by nobody and the process still calls
+Bedrock:
+
+    EMBEDDING_PROVIDER=openai EMBEDDING_BASE_URL=… EMBEDDING_API_KEY=… \
+      VECTOR_BUCKET=… STATE_BUCKET=… node dist/main.js
 
     POST /mcp      JSON-RPC; Authorization: Bearer <MCP_API_KEY> when a key is set
     GET  /health   liveness
 
 AWS credentials come from the pod's role. Never bake keys into the image.
+Failures that reach a tool are also written to stderr as one JSON line each, so
+an outage shows up in the pod's logs and not only inside somebody's agent run.
 
 ## Develop
 

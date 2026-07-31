@@ -12,9 +12,10 @@
  * and not an omission.
  */
 
+import { logError } from "./log.js";
 import { isMemoryType, isRecallMode, MEMORY_TYPES, type MemoryType } from "./types.js";
 import { MAX_CONTENT_BYTES } from "./store/vectors.js";
-import type { MemoryService } from "./service.js";
+import { STATS_SCAN_CAP, type MemoryService } from "./service.js";
 
 export interface ToolDefinition {
   name: string;
@@ -29,6 +30,17 @@ export interface ToolResult {
 }
 
 export const MAX_TAGS = 20;
+/**
+ * Byte ceilings for the two labels a model supplies alongside the body.
+ *
+ * Both are labels, so these are generous — but they are not decoration. The
+ * category shares a 2 KB filterable budget it can exhaust on its own, and the
+ * tags share a 40 KB one with a body that may be 32 KB. Bounded here so the
+ * model is told which field to shorten, rather than in the store alone, where
+ * the answer arrives as a size it cannot attribute to anything it sent.
+ */
+export const MAX_CATEGORY_BYTES = 128;
+export const MAX_TAG_BYTES = 64;
 const MAX_LIMIT = 50;
 
 export const TOOLS: readonly ToolDefinition[] = [
@@ -66,8 +78,9 @@ export const TOOLS: readonly ToolDefinition[] = [
       "Store something worth knowing in a later session. Use it for durable facts — an " +
       "architectural decision and its reason, a convention this project follows, a command " +
       "that turned out to be the right one. Do not use it for the current conversation's " +
-      "working state, which does not outlive the run. Near-identical content merges into the " +
-      "existing memory instead of creating a second copy.",
+      "working state, which does not outlive the run. Content near-identical to something " +
+      "already stored is not written a second time: you are told which memory already says " +
+      "it, and the tags and category you passed are discarded along with the rest.",
     inputSchema: {
       type: "object",
       properties: {
@@ -87,12 +100,13 @@ export const TOOLS: readonly ToolDefinition[] = [
         },
         category: {
           type: "string",
-          description: "Optional sub-label, e.g. 'decision', 'architecture', 'convention'.",
+          description:
+            `Optional sub-label, e.g. 'decision', 'architecture', 'convention' (max ${MAX_CATEGORY_BYTES} bytes).`,
         },
         tags: {
           type: "array",
           items: { type: "string" },
-          description: `Optional labels for retrieval (max ${MAX_TAGS}).`,
+          description: `Optional labels for retrieval (max ${MAX_TAGS}, each up to ${MAX_TAG_BYTES} bytes).`,
         },
       },
       required: ["content"],
@@ -126,8 +140,8 @@ export const TOOLS: readonly ToolDefinition[] = [
   {
     name: "memory_stats",
     description:
-      "How many memories this project has, broken down by type. Counts are approximate — " +
-      "usage figures are aggregated in the background and lag by up to a minute.",
+      "How many memories this project has, broken down by type. Exact up to " +
+      `${STATS_SCAN_CAP} memories; past that the answer says so and reports a lower bound.`,
     inputSchema: { type: "object", properties: {} },
   },
 ];
@@ -175,6 +189,13 @@ function optionalTags(args: Record<string, unknown>): string[] {
   const tags = (value as string[]).map((tag) => tag.trim()).filter(Boolean);
   if (tags.length > MAX_TAGS) {
     throw new ArgumentError(`\`tags\` may hold at most ${MAX_TAGS} entries.`);
+  }
+  const oversized = tags.find((tag) => Buffer.byteLength(tag, "utf8") > MAX_TAG_BYTES);
+  if (oversized !== undefined) {
+    throw new ArgumentError(
+      `each tag may be at most ${MAX_TAG_BYTES} bytes; "${oversized.slice(0, 30)}…" is longer. ` +
+        "Tags are labels to retrieve by, not content.",
+    );
   }
   return tags;
 }
@@ -233,6 +254,12 @@ export async function callTool(
         if (category !== undefined && category !== null && typeof category !== "string") {
           throw new ArgumentError("`category` must be a string.");
         }
+        if (typeof category === "string" && Buffer.byteLength(category, "utf8") > MAX_CATEGORY_BYTES) {
+          throw new ArgumentError(
+            `\`category\` may be at most ${MAX_CATEGORY_BYTES} bytes. It is a sub-label such as ` +
+              "'decision' or 'convention' — put the detail in `content`.",
+          );
+        }
         return text(
           await service.remember(tenant, {
             content,
@@ -258,8 +285,14 @@ export async function callTool(
     }
   } catch (error) {
     if (error instanceof ArgumentError) {
+      // The model's mistake, and it can see the message. Nothing for an
+      // operator to act on, so nothing goes to the log.
       return failure(`Error: ${error.message}`);
     }
+    // Everything else is a dependency failing. The model gets a sentence and
+    // moves on, which is right for the run and useless for whoever has to fix
+    // it — so it is said out loud here as well.
+    logError("tool_failed", error, { tenant, tool: name });
     return failure(
       `Error: the memory store could not complete this request — ${
         error instanceof Error ? error.message : String(error)

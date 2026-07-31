@@ -146,6 +146,29 @@ describe("remember", () => {
     assert.notEqual(result.isError, true);
   });
 
+  it("refuses labels that would overflow the metadata budget", async () => {
+    // Content is not the only thing a model chooses. The category shares a 2 KB
+    // filterable budget it can exhaust alone, and twenty tags share a 40 KB one
+    // with a body that may be 32 KB — both used to reach AWS and come back as a
+    // size the model could not attribute to anything it sent.
+    const longCategory = await call("remember", { content: "a fact", category: "d".repeat(3000) });
+    assert.equal(longCategory.isError, true);
+    assert.match(longCategory.content[0]!.text, /`category` may be at most/);
+
+    const longTag = await call("remember", { content: "a fact", tags: ["t".repeat(500)] });
+    assert.equal(longTag.isError, true);
+    assert.match(longTag.content[0]!.text, /each tag may be at most/);
+  });
+
+  it("still accepts labels of the size they are meant to be", async () => {
+    const ok = await call("remember", {
+      content: "a fact",
+      category: "decision",
+      tags: ["deploy", "ecr", "배포"],
+    });
+    assert.notEqual(ok.isError, true);
+  });
+
   it("refuses an unknown type", async () => {
     assert.equal((await call("remember", { content: "x", type: "episodic" })).isError, true);
   });

@@ -15,6 +15,7 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { authorizes } from "./auth.js";
 import type { Config } from "./config.js";
+import { logError } from "./log.js";
 import { parseTenant, TENANT_HEADER, TenantError } from "./tenant.js";
 import type { ToolDefinition, ToolResult } from "./tools.js";
 
@@ -110,15 +111,29 @@ function requireTenant(request: IncomingMessage): string {
   }
 }
 
+/** Its own type so the frame limit is not reported as though the JSON were bad. */
+class PayloadTooLarge extends Error {}
+
 async function readBody(request: IncomingMessage): Promise<string> {
   const chunks: Buffer[] = [];
   let size = 0;
+  let overflowed = false;
   for await (const chunk of request) {
     size += (chunk as Buffer).byteLength;
     if (size > MAX_BODY_BYTES) {
-      throw new Error("request body too large");
+      // Stop *buffering*, and keep reading. Destroying the socket here is the
+      // obvious move and the wrong one: it takes the response down with it, so
+      // the sender gets a connection reset in place of the reason it was
+      // refused. Draining costs bytes already on the wire and nothing else —
+      // the memory this limit exists to bound stays bounded either way.
+      overflowed = true;
+      chunks.length = 0;
+      continue;
     }
     chunks.push(chunk as Buffer);
+  }
+  if (overflowed) {
+    throw new PayloadTooLarge(`request body exceeds ${MAX_BODY_BYTES} bytes`);
   }
   return Buffer.concat(chunks).toString("utf8");
 }
@@ -162,11 +177,35 @@ export function createMcpServer(deps: ServerDeps): Server {
       let message: JsonRpcRequest;
       try {
         message = JSON.parse(await readBody(request)) as JsonRpcRequest;
-      } catch {
+      } catch (error) {
+        if (error instanceof PayloadTooLarge) {
+          send(response, 413, {
+            jsonrpc: "2.0",
+            id: null,
+            error: { code: INVALID_REQUEST, message: error.message },
+          });
+          return;
+        }
         send(response, 400, {
           jsonrpc: "2.0",
           id: null,
           error: { code: PARSE_ERROR, message: "parse error" },
+        });
+        return;
+      }
+      // A JSON-RPC batch. Refused rather than answered — this protocol revision
+      // removed batching — but refused *out loud*: an array has no `id`, so the
+      // notification branch below would take it for a notification and reply
+      // 202, leaving a client that sent one waiting for a response that is
+      // never coming.
+      if (Array.isArray(message)) {
+        send(response, 400, {
+          jsonrpc: "2.0",
+          id: null,
+          error: {
+            code: INVALID_REQUEST,
+            message: `batched requests are not supported in protocol ${PROTOCOL_VERSION}`,
+          },
         });
         return;
       }
@@ -182,6 +221,12 @@ export function createMcpServer(deps: ServerDeps): Server {
           result: await handle(deps, request, message),
         });
       } catch (error) {
+        // An RpcError is a answer this server meant to give — a bad tenant, an
+        // unknown method — and the client is being told. Anything else got here
+        // by surprise and is the only kind worth waking someone for.
+        if (!(error instanceof RpcError)) {
+          logError("request_failed", error, { method: message.method });
+        }
         const rpc =
           error instanceof RpcError
             ? error

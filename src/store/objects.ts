@@ -122,12 +122,25 @@ export class S3ObjectStore implements ObjectStore {
     }
     // DeleteObjects takes at most 1000 keys per call.
     for (let i = 0; i < keys.length; i += 1000) {
-      await this.client.send(
+      const response = await this.client.send(
         new DeleteObjectsCommand({
           Bucket: this.bucket,
           Delete: { Objects: keys.slice(i, i + 1000).map((Key) => ({ Key })), Quiet: true },
         }),
       );
+      // A per-key failure does not fail the request. `DeleteObjects` answers
+      // 200 and names the keys it could not remove, so a caller that only
+      // awaited the call was told the deletion succeeded whatever happened —
+      // and the callers here treat this as best-effort cleanup, meaning the
+      // one signal that it is not working was the one being discarded.
+      const failures = response.Errors ?? [];
+      if (failures.length > 0) {
+        const first = failures[0];
+        throw new Error(
+          `DeleteObjects could not remove ${failures.length} of ` +
+            `${Math.min(1000, keys.length - i)} keys: ${first?.Key} — ${first?.Code}`,
+        );
+      }
     }
   }
 }

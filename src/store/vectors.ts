@@ -24,7 +24,7 @@ import {
   QueryVectorsCommand,
   S3VectorsClient,
 } from "@aws-sdk/client-s3vectors";
-import type { MemoryType, StoredMemory } from "../types.js";
+import type { StoredMemory } from "../types.js";
 import { isMemoryType } from "../types.js";
 
 /**
@@ -51,13 +51,14 @@ export interface VectorHit {
 
 export interface VectorStore {
   put(memory: StoredMemory, embedding: number[]): Promise<void>;
-  /** Nearest neighbours within one tenant, already converted to similarity. */
-  query(
-    tenantId: string,
-    embedding: number[],
-    topK: number,
-    memoryType?: MemoryType,
-  ): Promise<VectorHit[]>;
+  /**
+   * Nearest neighbours within one tenant, already converted to similarity.
+   *
+   * Returns at most one page, however large `topK` is — see
+   * `MAX_RESULTS_PER_PAGE`. No ordering is promised; callers that need the
+   * best hit must find it rather than take the first.
+   */
+  query(tenantId: string, embedding: number[], topK: number): Promise<VectorHit[]>;
   /** Fetch by id, for listing. Missing ids are dropped rather than erroring. */
   get(tenantId: string, ids: string[]): Promise<StoredMemory[]>;
   delete(tenantId: string, ids: string[]): Promise<void>;
@@ -72,12 +73,68 @@ export function vectorKey(tenantId: string, id: string): string {
   return `${tenantId}#${id}`;
 }
 
-export function assertWithinMetadataBudget(content: string): void {
-  const bytes = Buffer.byteLength(content, "utf8");
-  if (bytes > MAX_CONTENT_BYTES) {
+/**
+ * The service's own quotas, in bytes.
+ *
+ * AWS documents these as "40 KB" and "2 KB" without saying whether the K is
+ * 1000 or 1024. Taken as 1000, because being wrong in that direction refuses a
+ * memory the service would have accepted, and being wrong in the other lets
+ * through the rejection this check exists to pre-empt.
+ */
+const MAX_METADATA_BYTES = 40_000;
+/** The filterable half's own, much smaller ceiling. `category` is what can fill it. */
+const MAX_FILTERABLE_BYTES = 2_000;
+/**
+ * Results one `QueryVectors` response can carry, whatever `topK` asked for.
+ *
+ * The rest come back behind a `nextToken` this store does not follow, so a
+ * `topK` above it would not raise an error — it would quietly return a prefix.
+ * Clamped rather than documented, so the truncation cannot be reintroduced by
+ * raising a constant somewhere else.
+ */
+const MAX_RESULTS_PER_PAGE = 100;
+
+/**
+ * Refuse a memory the service would refuse, and say which part is too big.
+ *
+ * Measured against the serialised metadata rather than against `content`
+ * alone, because content is not the only thing a *model* chose. `category`
+ * lands in the filterable half and can exhaust its 2 KB by itself; twenty tags
+ * land beside a 32 KB body and can carry the pair past 40 KB. Checking only the
+ * body left both of those to come back from AWS as a rejection naming neither
+ * the field nor the limit.
+ */
+export function assertWithinMetadataBudget(memory: StoredMemory): void {
+  const contentBytes = Buffer.byteLength(memory.content, "utf8");
+  if (contentBytes > MAX_CONTENT_BYTES) {
     throw new VectorStoreError(
-      `content is ${bytes} bytes; the maximum a single memory may hold is ${MAX_CONTENT_BYTES}. ` +
-        "Store the essential fact rather than the whole document.",
+      `content is ${contentBytes} bytes; the maximum a single memory may hold is ` +
+        `${MAX_CONTENT_BYTES}. Store the essential fact rather than the whole document.`,
+    );
+  }
+
+  const metadata = toMetadata(memory);
+  const nonFilterable = new Set<string>(NON_FILTERABLE_KEYS);
+  const filterable: Record<string, MetadataValue> = {};
+  for (const [key, value] of Object.entries(metadata)) {
+    if (!nonFilterable.has(key)) {
+      filterable[key] = value;
+    }
+  }
+
+  const filterableBytes = Buffer.byteLength(JSON.stringify(filterable), "utf8");
+  if (filterableBytes > MAX_FILTERABLE_BYTES) {
+    throw new VectorStoreError(
+      `the filterable metadata is ${filterableBytes} bytes against a ${MAX_FILTERABLE_BYTES} ` +
+        "byte limit. Shorten the category — it is a label, not a description.",
+    );
+  }
+
+  const totalBytes = Buffer.byteLength(JSON.stringify(metadata), "utf8");
+  if (totalBytes > MAX_METADATA_BYTES) {
+    throw new VectorStoreError(
+      `the memory and its labels are ${totalBytes} bytes against a ${MAX_METADATA_BYTES} byte ` +
+        "limit. Shorten the tags, or store a shorter fact.",
     );
   }
 }
@@ -118,6 +175,17 @@ export function toMetadata(memory: StoredMemory): Record<string, MetadataValue> 
  * deploy, and a record missing a field it did not used to have should sink in
  * the ranking, not fail the whole query.
  */
+/**
+ * A timestamp only if it is one.
+ *
+ * A string that will not parse is no more usable than a missing field, and is
+ * worse than one: it survives a type check and becomes NaN in the ranking. See
+ * `daysBetween` in `ranking.ts` for what that does to a result set.
+ */
+function readTimestamp(value: unknown): string | undefined {
+  return typeof value === "string" && Number.isFinite(Date.parse(value)) ? value : undefined;
+}
+
 export function fromMetadata(key: string, metadata: unknown): StoredMemory | undefined {
   if (!metadata || typeof metadata !== "object") {
     return undefined;
@@ -137,7 +205,7 @@ export function fromMetadata(key: string, metadata: unknown): StoredMemory | und
     memoryType: isMemoryType(raw.memoryType) ? raw.memoryType : "project",
     category: typeof raw.category === "string" ? raw.category : undefined,
     tags: Array.isArray(raw.tags) ? raw.tags.filter((t): t is string => typeof t === "string") : [],
-    createdAt: typeof raw.createdAt === "string" ? raw.createdAt : new Date(0).toISOString(),
+    createdAt: readTimestamp(raw.createdAt) ?? new Date(0).toISOString(),
     trustBase: typeof raw.trustBase === "number" ? raw.trustBase : 1,
   };
 }
@@ -150,7 +218,7 @@ export class S3VectorsStore implements VectorStore {
   ) {}
 
   async put(memory: StoredMemory, embedding: number[]): Promise<void> {
-    assertWithinMetadataBudget(memory.content);
+    assertWithinMetadataBudget(memory);
     await this.client.send(
       new PutVectorsCommand({
         vectorBucketName: this.bucket,
@@ -166,21 +234,18 @@ export class S3VectorsStore implements VectorStore {
     );
   }
 
-  async query(
-    tenantId: string,
-    embedding: number[],
-    topK: number,
-    memoryType?: MemoryType,
-  ): Promise<VectorHit[]> {
+  async query(tenantId: string, embedding: number[], topK: number): Promise<VectorHit[]> {
     const response = await this.client.send(
       new QueryVectorsCommand({
         vectorBucketName: this.bucket,
         indexName: this.index,
-        topK,
+        topK: Math.min(topK, MAX_RESULTS_PER_PAGE),
         queryVector: { float32: embedding },
-        // The isolation boundary. Every read is filtered by the tenant the
-        // request's header named, and nothing else can widen it.
-        filter: memoryType ? { tenantId, memoryType } : { tenantId },
+        // The isolation boundary, and a single key on purpose: a bare value is
+        // documented as an implicit `$eq`, which is the one filter shape this
+        // server needs and the only one it exercises. Nothing here may widen
+        // it, and nothing untested sits on this line.
+        filter: { tenantId },
         returnMetadata: true,
         returnDistance: true,
       }),
