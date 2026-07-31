@@ -1,0 +1,92 @@
+/**
+ * The entrypoint: read the environment, wire the layers, listen, and shut down
+ * without dropping counters on the floor.
+ *
+ * Configuration is validated before anything binds a port, so a missing bucket
+ * name stops a rollout at the readiness probe rather than surfacing as a tool
+ * error inside somebody's agent run.
+ */
+
+import { hostname } from "node:os";
+import { randomUUID } from "node:crypto";
+import { describeAuth } from "./auth.js";
+import { ConfigError, loadConfig } from "./config.js";
+import { BedrockEmbedder, bedrockInvoker, HttpEmbedder, type Embedder } from "./embeddings.js";
+import { createMcpServer, SERVER_NAME, SERVER_VERSION } from "./server.js";
+import { S3MemoryService } from "./service.js";
+import { createObjectStore } from "./store/objects.js";
+import { StatsTracker } from "./store/stats.js";
+import { createVectorStore } from "./store/vectors.js";
+import { callTool, TOOLS } from "./tools.js";
+
+let config;
+try {
+  config = loadConfig();
+} catch (error) {
+  if (error instanceof ConfigError) {
+    console.error(`configuration error: ${error.message}`);
+    process.exit(1);
+  }
+  throw error;
+}
+
+const { store: vectors } = createVectorStore(config.region, config.vectorBucket, config.vectorIndex);
+const { store: objects } = createObjectStore(config.region, config.stateBucket);
+
+const stats = new StatsTracker(objects, {
+  // Kubernetes sets HOSTNAME to the pod name. The random suffix distinguishes
+  // one boot from the next, so a restarted pod never rewrites a shard its
+  // previous life had already written — shards are append-only by construction.
+  podId: `${process.env.HOSTNAME ?? hostname()}-${randomUUID().slice(0, 8)}`,
+  flushMs: config.statsFlushMs,
+  compactThreshold: config.statsCompactThreshold,
+});
+stats.start();
+
+const embedder: Embedder =
+  config.embedding.provider === "bedrock"
+    ? new BedrockEmbedder({ ...config.embedding, invoke: bedrockInvoker(config.region) })
+    : new HttpEmbedder(config.embedding);
+
+const service = new S3MemoryService(
+  vectors,
+  objects,
+  stats,
+  embedder,
+  config.recallMinSimilarity,
+);
+
+const server = createMcpServer({
+  config,
+  tools: {
+    definitions: () => TOOLS,
+    call: (tenant, name, args) => callTool(service, tenant, name, args),
+  },
+});
+
+server.listen(config.port, () => {
+  console.log(`${SERVER_NAME} v${SERVER_VERSION} listening on :${config.port} (POST /mcp)`);
+  console.log(
+    `store: s3vectors://${config.vectorBucket}/${config.vectorIndex} ` +
+      `(${config.embedding.provider}:${config.embedding.model}, ${config.embedding.dimension}d), ` +
+      `state: s3://${config.stateBucket}`,
+  );
+  // Always, not only when open: an operator reading logs to find out which mode
+  // an instance is in should not have to infer it from a line that is missing.
+  const notice = describeAuth(config.apiKey);
+  if (config.apiKey) {
+    console.log(notice);
+  } else {
+    console.warn(notice);
+  }
+});
+
+for (const signal of ["SIGTERM", "SIGINT"] as const) {
+  process.on(signal, () => {
+    // Counters first: the flush is the only pod-local state worth saving, and a
+    // closed server means nothing is still incrementing it.
+    server.close(() => {
+      void stats.stop().finally(() => process.exit(0));
+    });
+  });
+}

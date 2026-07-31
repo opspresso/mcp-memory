@@ -1,0 +1,107 @@
+name: Release (github + ecr + ghcr)
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+  packages: write
+
+# One build per tag.
+concurrency:
+  group: "release-${{ github.ref_name }}"
+  cancel-in-progress: true
+
+env:
+  AWS_REGION: ap-northeast-2
+  ECR_IMAGE: 396608815058.dkr.ecr.ap-northeast-2.amazonaws.com/mcp-memory
+  GHCR_IMAGE: ghcr.io/${{ github.repository_owner }}/mcp-memory
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+
+  # Notes come from the commit subjects between this tag and the previous one, so
+  # the release page says what changed without anyone writing it twice. Scoped
+  # `contents: write` here rather than at the top: only this job publishes.
+  github-release:
+    needs: verify
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # Shallow by default, and `git describe` needs the tags to find the
+          # previous one.
+          fetch-depth: 0
+
+      - name: Create GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          prev="$(git describe --tags --abbrev=0 "${tag}^" 2>/dev/null || true)"
+          if [ -n "$prev" ]; then
+            notes="$(git log --no-merges --pretty='- %s' "${prev}..${tag}" | grep -v '^- chore: release' || true)"
+          else
+            notes="$(git log --no-merges --pretty='- %s' "${tag}" | grep -v '^- chore: release' || true)"
+          fi
+          gh release create "$tag" --title "$tag" --notes "$notes"
+
+  release:
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: arn:aws:iam::396608815058:role/github--mcp-memory-ecr
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Login to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      # Attestations off: they turn a single-platform build into an image index
+      # plus two untagged children, so every release costs three ECR entries
+      # instead of one. Nothing here consumes the provenance.
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          sbom: false
+          tags: |
+            ${{ env.ECR_IMAGE }}:${{ github.ref_name }}
+            ${{ env.ECR_IMAGE }}:latest
+            ${{ env.GHCR_IMAGE }}:${{ github.ref_name }}
+            ${{ env.GHCR_IMAGE }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
