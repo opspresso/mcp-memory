@@ -44,6 +44,16 @@ interface Merged {
 
 const EMPTY_MERGED: Merged = { counts: {}, watermark: "" };
 
+/**
+ * Shards fetched at once when merging.
+ *
+ * Bounded rather than unbounded: compaction normally keeps the count near
+ * `compactThreshold`, but a tenant whose compaction has been failing can have
+ * a listing's worth of them, and opening a thousand sockets to recover from
+ * that is its own outage.
+ */
+const SHARD_READ_BATCH = 16;
+
 export interface StatsOptions {
   podId: string;
   flushMs: number;
@@ -215,10 +225,20 @@ export class StatsTracker {
 
     const counts: Delta = {};
     addInto(counts, merged.value.counts);
-    for (const key of fresh) {
-      const object = await this.store.get(key);
-      if (object) {
-        addInto(counts, parseDelta(object.body));
+    // Fetched in batches rather than one at a time. This runs on the critical
+    // path of every recall whose cache has expired, and a shard is a few
+    // hundred bytes — so serialising the round trips spent most of a recall's
+    // latency waiting, once per shard, for nothing that depended on the last
+    // one. Order does not matter here: counts add and timestamps take the
+    // later, which is the whole reason this merge converges.
+    for (let i = 0; i < fresh.length; i += SHARD_READ_BATCH) {
+      const batch = await Promise.all(
+        fresh.slice(i, i + SHARD_READ_BATCH).map((key) => this.store.get(key)),
+      );
+      for (const object of batch) {
+        if (object) {
+          addInto(counts, parseDelta(object.body));
+        }
       }
     }
 

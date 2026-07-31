@@ -72,12 +72,52 @@ export function vectorKey(tenantId: string, id: string): string {
   return `${tenantId}#${id}`;
 }
 
-export function assertWithinMetadataBudget(content: string): void {
-  const bytes = Buffer.byteLength(content, "utf8");
-  if (bytes > MAX_CONTENT_BYTES) {
+/** Everything one vector's metadata may hold, filterable and not. */
+const MAX_METADATA_BYTES = 40_000;
+/** The filterable half's own, much smaller ceiling. `category` is what can fill it. */
+const MAX_FILTERABLE_BYTES = 2_048;
+
+/**
+ * Refuse a memory the service would refuse, and say which part is too big.
+ *
+ * Measured against the serialised metadata rather than against `content`
+ * alone, because content is not the only thing a *model* chose. `category`
+ * lands in the filterable half and can exhaust its 2 KB by itself; twenty tags
+ * land beside a 32 KB body and can carry the pair past 40 KB. Checking only the
+ * body left both of those to come back from AWS as a rejection naming neither
+ * the field nor the limit.
+ */
+export function assertWithinMetadataBudget(memory: StoredMemory): void {
+  const contentBytes = Buffer.byteLength(memory.content, "utf8");
+  if (contentBytes > MAX_CONTENT_BYTES) {
     throw new VectorStoreError(
-      `content is ${bytes} bytes; the maximum a single memory may hold is ${MAX_CONTENT_BYTES}. ` +
-        "Store the essential fact rather than the whole document.",
+      `content is ${contentBytes} bytes; the maximum a single memory may hold is ` +
+        `${MAX_CONTENT_BYTES}. Store the essential fact rather than the whole document.`,
+    );
+  }
+
+  const metadata = toMetadata(memory);
+  const nonFilterable = new Set<string>(NON_FILTERABLE_KEYS);
+  const filterable: Record<string, MetadataValue> = {};
+  for (const [key, value] of Object.entries(metadata)) {
+    if (!nonFilterable.has(key)) {
+      filterable[key] = value;
+    }
+  }
+
+  const filterableBytes = Buffer.byteLength(JSON.stringify(filterable), "utf8");
+  if (filterableBytes > MAX_FILTERABLE_BYTES) {
+    throw new VectorStoreError(
+      `the filterable metadata is ${filterableBytes} bytes against a ${MAX_FILTERABLE_BYTES} ` +
+        "byte limit. Shorten the category — it is a label, not a description.",
+    );
+  }
+
+  const totalBytes = Buffer.byteLength(JSON.stringify(metadata), "utf8");
+  if (totalBytes > MAX_METADATA_BYTES) {
+    throw new VectorStoreError(
+      `the memory and its labels are ${totalBytes} bytes against a ${MAX_METADATA_BYTES} byte ` +
+        "limit. Shorten the tags, or store a shorter fact.",
     );
   }
 }
@@ -161,7 +201,7 @@ export class S3VectorsStore implements VectorStore {
   ) {}
 
   async put(memory: StoredMemory, embedding: number[]): Promise<void> {
-    assertWithinMetadataBudget(memory.content);
+    assertWithinMetadataBudget(memory);
     await this.client.send(
       new PutVectorsCommand({
         vectorBucketName: this.bucket,

@@ -30,6 +30,17 @@ export interface ToolResult {
 }
 
 export const MAX_TAGS = 20;
+/**
+ * Byte ceilings for the two labels a model supplies alongside the body.
+ *
+ * Both are labels, so these are generous — but they are not decoration. The
+ * category shares a 2 KB filterable budget it can exhaust on its own, and the
+ * tags share a 40 KB one with a body that may be 32 KB. Bounded here so the
+ * model is told which field to shorten, rather than in the store alone, where
+ * the answer arrives as a size it cannot attribute to anything it sent.
+ */
+export const MAX_CATEGORY_BYTES = 128;
+export const MAX_TAG_BYTES = 64;
 const MAX_LIMIT = 50;
 
 export const TOOLS: readonly ToolDefinition[] = [
@@ -89,12 +100,13 @@ export const TOOLS: readonly ToolDefinition[] = [
         },
         category: {
           type: "string",
-          description: "Optional sub-label, e.g. 'decision', 'architecture', 'convention'.",
+          description:
+            `Optional sub-label, e.g. 'decision', 'architecture', 'convention' (max ${MAX_CATEGORY_BYTES} bytes).`,
         },
         tags: {
           type: "array",
           items: { type: "string" },
-          description: `Optional labels for retrieval (max ${MAX_TAGS}).`,
+          description: `Optional labels for retrieval (max ${MAX_TAGS}, each up to ${MAX_TAG_BYTES} bytes).`,
         },
       },
       required: ["content"],
@@ -178,6 +190,13 @@ function optionalTags(args: Record<string, unknown>): string[] {
   if (tags.length > MAX_TAGS) {
     throw new ArgumentError(`\`tags\` may hold at most ${MAX_TAGS} entries.`);
   }
+  const oversized = tags.find((tag) => Buffer.byteLength(tag, "utf8") > MAX_TAG_BYTES);
+  if (oversized !== undefined) {
+    throw new ArgumentError(
+      `each tag may be at most ${MAX_TAG_BYTES} bytes; "${oversized.slice(0, 30)}…" is longer. ` +
+        "Tags are labels to retrieve by, not content.",
+    );
+  }
   return tags;
 }
 
@@ -234,6 +253,12 @@ export async function callTool(
         const category = args.category;
         if (category !== undefined && category !== null && typeof category !== "string") {
           throw new ArgumentError("`category` must be a string.");
+        }
+        if (typeof category === "string" && Buffer.byteLength(category, "utf8") > MAX_CATEGORY_BYTES) {
+          throw new ArgumentError(
+            `\`category\` may be at most ${MAX_CATEGORY_BYTES} bytes. It is a sub-label such as ` +
+              "'decision' or 'convention' — put the detail in `content`.",
+          );
         }
         return text(
           await service.remember(tenant, {

@@ -176,6 +176,21 @@ describe("StatsTracker", () => {
     }, TypeError);
   });
 
+  it("merges more shards than one batch holds without losing any", async () => {
+    // Shards are fetched in bounded batches now. The merge is order-independent
+    // by construction, but the batching is not allowed to drop a tail.
+    const store = new InMemoryObjectStore();
+    let clock = START;
+    const pod = tracker(store, "pod-a", { now: () => clock });
+    for (let i = 0; i < 40; i++) {
+      pod.record(TENANT, "m1");
+      await pod.flush();
+      clock += 1000;
+    }
+
+    assert.equal(await totalFor(store, "m1"), 40);
+  });
+
   it("keeps tenants apart", async () => {
     const store = new InMemoryObjectStore();
     const pod = tracker(store, "pod-a");
