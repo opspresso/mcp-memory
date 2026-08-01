@@ -1,4 +1,4 @@
-FROM node:22-alpine AS build
+FROM node:24-alpine AS build
 WORKDIR /app
 # tsconfig.build.json too: it is what `npm run build` points tsc at, and it is
 # the file that excludes the tests and the fakes from dist.
@@ -7,7 +7,7 @@ RUN npm ci
 COPY src ./src
 RUN npm run build
 
-FROM node:22-alpine
+FROM node:24-alpine
 WORKDIR /app
 ENV NODE_ENV=production
 COPY package.json package-lock.json ./
