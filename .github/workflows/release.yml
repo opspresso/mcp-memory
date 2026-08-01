@@ -109,6 +109,12 @@ jobs:
   # Its own job, downstream of the image push: a deploy-trigger failure reads
   # as exactly that, and rerunning this job alone redeploys without a rebuild.
   # Tag pushes only — a manual dispatch run has no version a chart could pin.
+  #
+  # The token is the org-level GHP_TOKEN rather than the GitOps App's private
+  # key: this repository is public, and the App key opens every repository the
+  # App is installed on — more than a public repo should carry. (GITHUB_TOKEN
+  # cannot be used either way: it is scoped to the repository running the
+  # workflow, and this dispatch targets another one.)
   gitops:
     needs: release
     if: startsWith(github.ref, 'refs/tags/')
@@ -117,24 +123,11 @@ jobs:
     permissions:
       contents: read
     steps:
-      # A repository_dispatch to another repository cannot use GITHUB_TOKEN: it
-      # is scoped to the repository running the workflow. This mints a
-      # short-lived installation token instead, scoped to argocd-env-demo alone,
-      # so there is no long-lived PAT to rotate or over-scope.
-      - name: Mint a token for the GitOps repository
-        id: gitops-token
-        uses: actions/create-github-app-token@v3
-        with:
-          client-id: ${{ vars.GITOPS_CLIENT_ID }}
-          private-key: ${{ secrets.GITOPS_PRIVATE_KEY }}
-          owner: opspresso
-          repositories: argocd-env-demo
-
       # `phase: alpha` is the deployed one (env/eks-demo.yaml names it), and
       # `container: app` is the top-level key in this chart's values file.
       - name: Trigger GitOps 🚀
         env:
-          GH_TOKEN: ${{ steps.gitops-token.outputs.token }}
+          GH_TOKEN: ${{ secrets.GHP_TOKEN }}
         run: |
           gh api repos/opspresso/argocd-env-demo/dispatches \
             -f event_type=gitops \
