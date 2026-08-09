@@ -22,7 +22,7 @@ import type { ToolDefinition, ToolResult } from "./tools.js";
 export const PROTOCOL_VERSION = "2025-06-18";
 export const SERVER_NAME = "mcp-memory";
 /** Tracks `version` in package.json; both are what a client is told this is. */
-export const SERVER_VERSION = "0.2.1";
+export const SERVER_VERSION = "0.3.0";
 /** A remembered body is capped well below this by the tools; this only bounds the frame. */
 const MAX_BODY_BYTES = 1024 * 1024;
 
