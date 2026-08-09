@@ -11,6 +11,7 @@ import { hostname } from "node:os";
 import { randomUUID } from "node:crypto";
 import { describeAuth } from "./auth.js";
 import { ConfigError, loadConfig } from "./config.js";
+import { KnowledgeBaseRetriever, knowledgeBaseInvoker } from "./docs.js";
 import { BedrockEmbedder, bedrockInvoker, HttpEmbedder, type Embedder } from "./embeddings.js";
 import { createMcpServer, SERVER_NAME, SERVER_VERSION } from "./server.js";
 import { S3MemoryService } from "./service.js";
@@ -18,7 +19,7 @@ import { createObjectStore } from "./store/objects.js";
 import { StatsTracker } from "./store/stats.js";
 import { createVectorStore } from "./store/vectors.js";
 import { gracefulShutdown } from "./shutdown.js";
-import { callTool, TOOLS } from "./tools.js";
+import { callTool, toolCatalogue } from "./tools.js";
 
 /**
  * How long in-flight requests get before the counter flush runs regardless.
@@ -65,11 +66,22 @@ const service = new S3MemoryService(
   config.recallMinSimilarity,
 );
 
+const docs = config.knowledgeBaseId
+  ? new KnowledgeBaseRetriever({
+      knowledgeBaseId: config.knowledgeBaseId,
+      invoke: knowledgeBaseInvoker(config.region),
+    })
+  : undefined;
+
+// Fixed for the process lifetime, which is what `initialize` promises with
+// `listChanged: false`.
+const catalogue = toolCatalogue(docs !== undefined);
+
 const server = createMcpServer({
   config,
   tools: {
-    definitions: () => TOOLS,
-    call: (tenant, name, args) => callTool(service, tenant, name, args),
+    definitions: () => catalogue,
+    call: (tenant, name, args) => callTool(service, tenant, name, args, docs),
   },
 });
 
@@ -79,6 +91,11 @@ server.listen(config.port, () => {
     `store: s3vectors://${config.vectorBucket}/${config.vectorIndex} ` +
       `(${config.embedding.provider}:${config.embedding.model}, ${config.embedding.dimension}d), ` +
       `state: s3://${config.stateBucket}`,
+  );
+  console.log(
+    config.knowledgeBaseId
+      ? `docs: bedrock-kb://${config.knowledgeBaseId} (search_docs offered)`
+      : "docs: no KNOWLEDGE_BASE_ID — memories only, search_docs not offered",
   );
   // Always, not only when open: an operator reading logs to find out which mode
   // an instance is in should not have to infer it from a line that is missing.

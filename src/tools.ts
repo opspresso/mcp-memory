@@ -1,6 +1,8 @@
 /**
- * The five tools, their schemas, and the dispatch from a JSON-RPC name to the
- * service that does the work.
+ * The five memory tools, the optional docs tool, their schemas, and the
+ * dispatch from a JSON-RPC name to the service that does the work.
+ * `search_docs` only exists in a catalogue when a knowledge base is configured
+ * — see `toolCatalogue`.
  *
  * Descriptions are load-bearing. They are the whole of what the model knows
  * about this server, and the one about `recall` has a job beyond describing
@@ -12,6 +14,7 @@
  * and not an omission.
  */
 
+import { renderDocs, type DocsRetriever } from "./docs.js";
 import { logError } from "./log.js";
 import { isMemoryType, isRecallMode, MEMORY_TYPES, type MemoryType } from "./types.js";
 import { MAX_CONTENT_BYTES } from "./store/vectors.js";
@@ -146,6 +149,43 @@ export const TOOLS: readonly ToolDefinition[] = [
   },
 ];
 
+/** The Retrieve API's own ceiling on a query, in characters. */
+export const MAX_QUERY_CHARS = 1000;
+/** The knowledge base's own default result count. */
+const DEFAULT_DOCS_LIMIT = 5;
+
+/**
+ * Not part of `TOOLS`: the memory tools exist everywhere, this one only where a
+ * knowledge base is configured. `toolCatalogue` is the one place they combine.
+ */
+export const SEARCH_DOCS_TOOL: ToolDefinition = {
+  name: "search_docs",
+  description:
+    "Search the shared documentation library by meaning and return the most relevant " +
+    "excerpts, each with the source document it came from. Use it when this project's own " +
+    "memories (recall) do not answer — how-tos, policies, reference material. Results are " +
+    "excerpts, not whole documents. An empty result means nothing close is indexed, which " +
+    "is not the same as the subject having no answer.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      query: {
+        type: "string",
+        description: `What you want to find, in natural language (max ${MAX_QUERY_CHARS} characters).`,
+      },
+      limit: {
+        type: "integer",
+        description: `Maximum excerpts to return (1-${MAX_LIMIT}). Default ${DEFAULT_DOCS_LIMIT}.`,
+      },
+    },
+    required: ["query"],
+  },
+};
+
+export function toolCatalogue(withDocs: boolean): readonly ToolDefinition[] {
+  return withDocs ? [...TOOLS, SEARCH_DOCS_TOOL] : TOOLS;
+}
+
 class ArgumentError extends Error {}
 
 function requireString(args: Record<string, unknown>, name: string): string {
@@ -221,6 +261,7 @@ export async function callTool(
   tenant: string,
   name: string,
   args: Record<string, unknown>,
+  docs?: DocsRetriever,
 ): Promise<ToolResult> {
   try {
     switch (name) {
@@ -280,6 +321,30 @@ export async function callTool(
         return text(await service.forget(tenant, requireString(args, "id")));
       case "memory_stats":
         return text(await service.stats(tenant));
+      case "search_docs": {
+        // Without a knowledge base the tool is absent from the catalogue and
+        // the server rejects the name before it gets here — but the dispatch
+        // must not depend on that.
+        if (!docs) {
+          return failure(`Error: unknown tool "search_docs".`);
+        }
+        const query = requireString(args, "query");
+        // Characters, not bytes: that is how the Retrieve API measures it.
+        if (query.length > MAX_QUERY_CHARS) {
+          throw new ArgumentError(
+            `\`query\` is ${query.length} characters; the maximum is ${MAX_QUERY_CHARS}. ` +
+              "Ask for the one thing you want to find.",
+          );
+        }
+        // The tenant is deliberately not part of the search: the documentation
+        // library is shared across tenants, unlike the memories. It still lands
+        // in the error log context below.
+        return text(
+          await docs
+            .retrieve(query, optionalLimit(args, DEFAULT_DOCS_LIMIT) ?? DEFAULT_DOCS_LIMIT)
+            .then((results) => renderDocs(query, results)),
+        );
+      }
       default:
         return failure(`Error: unknown tool "${name}".`);
     }
@@ -293,10 +358,11 @@ export async function callTool(
     // moves on, which is right for the run and useless for whoever has to fix
     // it — so it is said out loud here as well.
     logError("tool_failed", error, { tenant, tool: name });
+    const message = error instanceof Error ? error.message : String(error);
     return failure(
-      `Error: the memory store could not complete this request — ${
-        error instanceof Error ? error.message : String(error)
-      }`,
+      name === "search_docs"
+        ? `Error: the documentation index could not be searched — ${message}`
+        : `Error: the memory store could not complete this request — ${message}`,
     );
   }
 }

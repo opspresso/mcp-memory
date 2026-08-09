@@ -9,6 +9,7 @@ An MCP server that gives an Agent Studio project a memory that outlives a run.
 | `list_memories(type?, limit?)` | — | this project's memories, newest first |
 | `forget(id)` | an id from `recall` | confirmation, or that no such memory exists |
 | `memory_stats()` | — | how many memories there are, by type; a lower bound past 10,000 |
+| `search_docs(query, limit?)` | a question in natural language | matching documentation excerpts with their sources — offered only when `KNOWLEDGE_BASE_ID` is set |
 
 It exists because every run starts from nothing. An agent that decided something
 last week, or was told a convention, or worked out which command actually works,
@@ -105,6 +106,7 @@ Worth knowing before you rely on it:
 | `VECTOR_BUCKET` | — | **required.** S3 Vectors bucket holding the memories |
 | `VECTOR_INDEX` | `memories` | index within it |
 | `STATE_BUCKET` | — | **required.** Ordinary S3 bucket for counters and the recency index |
+| `KNOWLEDGE_BASE_ID` | unset | Bedrock Knowledge Base behind `search_docs`; unset, the tool is not offered at all |
 | `EMBEDDING_PROVIDER` | `bedrock` | `bedrock` or `openai` |
 | `EMBEDDING_MODEL` | `amazon.titan-embed-text-v2:0` | `text-embedding-3-small` under `openai` |
 | `EMBEDDING_DIM` | `1024` | `1536` under `openai`. Must equal the index's dimension |
@@ -237,6 +239,30 @@ something the index will reject.
 
 The four non-filterable keys must be exactly those. They are where the body and
 its provenance live, and the list cannot be changed once the index exists.
+
+## The documentation library (optional)
+
+Setting `KNOWLEDGE_BASE_ID` adds a sixth tool, `search_docs`, backed by a
+Bedrock Knowledge Base. Unset, the tool is not offered — not listed, not
+callable — and the SDK behind it is never loaded.
+
+The knowledge base is created outside this repo, like the vector index, and the
+division of labour is strict: the KB owns its own S3 Vectors index (which may
+live in the same vector bucket, under a different index name) and its own
+ingestion — chunking, embedding, and syncing whatever S3 bucket holds the source
+documents. This server only queries it, over the `Retrieve` API. The KB embeds
+the query itself with whatever model it was built on, so the `EMBEDDING_*`
+settings play no part and cannot mismatch it.
+
+Two things the deployment must line up:
+
+- The pod's role needs `bedrock:Retrieve` on the knowledge base's ARN.
+- The KB must live in `AWS_REGION` — the server uses one region for everything.
+
+Unlike the memories, the library is **shared across all tenants**. The
+`X-Memory-Tenant` header is still required on every request, but it does not
+filter documents; two projects with different tenants search the same library.
+Memories remain strictly per-tenant.
 
 ## Registering it with Agent Studio
 

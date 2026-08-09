@@ -1,5 +1,5 @@
 /**
- * What the five tools actually do, and the only place the stores are combined.
+ * What the five memory tools actually do, and the only place the stores are combined.
  *
  * The shape of every operation follows from one decision: memories are
  * immutable. Nothing here updates a stored memory. `remember` writes a new one

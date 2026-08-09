@@ -22,6 +22,11 @@ export interface Config {
   vectorIndex: string;
   /** Ordinary S3 bucket holding the access counters and the recency index. */
   stateBucket: string;
+  /**
+   * Bedrock Knowledge Base backing `search_docs`. Unset means memories-only:
+   * the tool is not offered at all, and the SDK behind it is never loaded.
+   */
+  knowledgeBaseId: string | undefined;
   embedding: EmbeddingConfig;
   /**
    * The cosine similarity below which a hit is not relevant to the query at all.
@@ -134,6 +139,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     vectorBucket: required(env, "VECTOR_BUCKET"),
     vectorIndex: env.VECTOR_INDEX?.trim() || "memories",
     stateBucket: required(env, "STATE_BUCKET"),
+    knowledgeBaseId: env.KNOWLEDGE_BASE_ID?.trim() || undefined,
     embedding: loadEmbedding(env),
     recallMinSimilarity: ratio(env, "RECALL_MIN_SIMILARITY", 0.1),
     statsFlushMs: integer(env, "STATS_FLUSH_MS", 30_000),

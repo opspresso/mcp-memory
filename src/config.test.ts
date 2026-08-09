@@ -33,6 +33,15 @@ describe("loadConfig", () => {
       /EMBEDDING_BASE_URL is required/,
     );
   });
+
+  it("treats the knowledge base as optional, with nothing else implied", () => {
+    // Unset is a mode, not a mistake: memories-only, and search_docs is simply
+    // not offered. Nothing becomes required alongside it when set — the region
+    // is AWS_REGION either way.
+    assert.equal(loadConfig(MINIMAL).knowledgeBaseId, undefined);
+    assert.equal(loadConfig({ ...MINIMAL, KNOWLEDGE_BASE_ID: "   " }).knowledgeBaseId, undefined);
+    assert.equal(loadConfig({ ...MINIMAL, KNOWLEDGE_BASE_ID: " KB123 " }).knowledgeBaseId, "KB123");
+  });
 });
 
 describe("RECALL_MIN_SIMILARITY", () => {

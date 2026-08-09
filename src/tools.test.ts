@@ -9,9 +9,10 @@
 
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
+import type { DocsRetriever } from "./docs.js";
 import type { MemoryService } from "./service.js";
 import { MAX_CONTENT_BYTES } from "./store/vectors.js";
-import { callTool, MAX_TAGS, TOOLS } from "./tools.js";
+import { callTool, MAX_QUERY_CHARS, MAX_TAGS, SEARCH_DOCS_TOOL, TOOLS, toolCatalogue } from "./tools.js";
 
 const seen: unknown[] = [];
 
@@ -51,17 +52,28 @@ function call(name: string, args: Record<string, unknown>) {
 }
 
 describe("tool definitions", () => {
-  it("declares the five tools the README documents", () => {
+  it("declares the five memory tools the README documents", () => {
     assert.deepEqual(
       TOOLS.map((tool) => tool.name).sort(),
       ["forget", "list_memories", "memory_stats", "recall", "remember"],
     );
   });
 
+  it("offers search_docs only when a knowledge base is configured", () => {
+    // The memories-only guarantee hangs on this split: `TOOLS` stays the five,
+    // and `toolCatalogue` is the one place the docs tool joins them.
+    assert.ok(!TOOLS.includes(SEARCH_DOCS_TOOL));
+    assert.equal(toolCatalogue(false), TOOLS);
+    assert.deepEqual(
+      toolCatalogue(true).map((tool) => tool.name),
+      [...TOOLS.map((tool) => tool.name), "search_docs"],
+    );
+  });
+
   it("does not offer a tenant argument on any tool", () => {
     // The isolation boundary is the header. A tenant argument would let the
     // model name its own — including a model talked into it by text it just read.
-    for (const tool of TOOLS) {
+    for (const tool of toolCatalogue(true)) {
       const properties = (tool.inputSchema as { properties?: Record<string, unknown> }).properties;
       assert.ok(!properties || !("tenant" in properties), `${tool.name} exposes a tenant argument`);
     }
@@ -189,6 +201,67 @@ describe("list_memories and forget", () => {
     assert.equal((await call("forget", {})).isError, true);
     await call("forget", { id: "01ABC" });
     assert.equal(seen[0], "01ABC");
+  });
+});
+
+describe("search_docs", () => {
+  const docsSeen: unknown[] = [];
+  const retriever: DocsRetriever = {
+    retrieve: async (query, limit) => {
+      docsSeen.push({ query, limit });
+      return [{ excerpt: "an excerpt", source: "s3://docs/a.md", score: 0.5 }];
+    },
+  };
+
+  function search(args: Record<string, unknown>, docs: DocsRetriever = retriever) {
+    docsSeen.length = 0;
+    return callTool(service, "demo", "search_docs", args, docs);
+  }
+
+  it("searches with the knowledge base's default limit", async () => {
+    const result = await search({ query: "how do we deploy" });
+    assert.match(result.content[0]!.text, /^\[DOCS\]/);
+    assert.deepEqual(docsSeen[0], { query: "how do we deploy", limit: 5 });
+  });
+
+  it("passes a valid limit through and refuses one outside the range", async () => {
+    await search({ query: "x", limit: 3 });
+    assert.deepEqual(docsSeen[0], { query: "x", limit: 3 });
+
+    for (const limit of [0, 51, 1.5, "3"]) {
+      const result = await search({ query: "x", limit });
+      assert.equal(result.isError, true, `should reject limit ${JSON.stringify(limit)}`);
+    }
+  });
+
+  it("refuses an empty query and an oversized one, in characters", async () => {
+    assert.equal((await search({ query: "" })).isError, true);
+
+    // Characters, not bytes: the Retrieve API's ceiling is measured that way,
+    // unlike the byte budgets on remember.
+    const result = await search({ query: "가".repeat(MAX_QUERY_CHARS + 1) });
+    assert.equal(result.isError, true);
+    assert.match(result.content[0]!.text, /characters/);
+  });
+
+  it("does not exist without a knowledge base, even at the dispatch layer", async () => {
+    // The server already rejects the name when the catalogue omits it; this is
+    // the dispatch refusing to depend on that.
+    const result = await callTool(service, "demo", "search_docs", { query: "x" });
+    assert.equal(result.isError, true);
+    assert.match(result.content[0]!.text, /unknown tool "search_docs"/);
+  });
+
+  it("blames the documentation index, not the memory store, when the KB fails", async () => {
+    const result = await search({ query: "x" }, {
+      retrieve: async () => {
+        throw new Error("KB is having a day");
+      },
+    });
+    assert.equal(result.isError, true);
+    assert.match(result.content[0]!.text, /documentation index could not be searched/);
+    assert.match(result.content[0]!.text, /KB is having a day/);
+    assert.ok(!/memory store/.test(result.content[0]!.text));
   });
 });
 
