@@ -65,8 +65,9 @@ s3://<STATE_BUCKET>/
 
 ## Which memories a caller gets
 
-**The tenant comes from the `X-Memory-Tenant` header and never from a tool
-argument.** Agent Studio stores per-server headers encrypted and merges a
+**The tenant comes from a header and never from a tool argument** — an explicit
+`X-Memory-Tenant`, or the `X-Tenant-Id` header Agent Studio stamps on
+every MCP request when no explicit one is configured (explicit wins). Agent Studio stores per-server headers encrypted and merges a
 version's overrides in at dispatch, so the header is something an operator
 configured. A tool argument is something the *model* chose — and a model that
 can name its own tenant can read another project's memories by asking, including
@@ -259,9 +260,9 @@ Two things the deployment must line up:
 - The pod's role needs `bedrock:Retrieve` on the knowledge base's ARN.
 - The KB must live in `AWS_REGION` — the server uses one region for everything.
 
-Unlike the memories, the library is **shared across all tenants**. The
-`X-Memory-Tenant` header is still required on every request, but it does not
-filter documents; two projects with different tenants search the same library.
+Unlike the memories, the library is **shared across all tenants**. A tenant
+header is still required on every request, but it does not filter documents;
+two projects with different tenants search the same library.
 Memories remain strictly per-tenant.
 
 ## Registering it with Agent Studio
@@ -273,15 +274,23 @@ what admits this one too.
 
 1. **MCP servers → Add**
    - URL: `http://mcp-memory.agent-mcps.svc.cluster.local/mcp`
-   - Header: `X-Memory-Tenant: <project name>`
    - Description: one line — it becomes a row in the model's system prompt
-2. **Test connection.** A missing or malformed tenant header fails here, by design.
-3. Bind it on the project version that should have a memory. A per-version
-   header override can point one version at a different tenant.
+   - No tenant header needed: Agent Studio stamps every MCP request with
+     `X-Tenant-Id: <project name>`, and this server reads it when no
+     explicit `X-Memory-Tenant` is configured — each project lands in its own
+     tenant with zero per-project setup.
+2. **Test connection fails on the missing tenant, by design.** The probe runs
+   with no project, so it carries no automatic header; the failure proves the
+   server is reachable and refusing an unscoped caller. The same applies to the
+   capability catalog's reindex probe, which indexes this server at server level
+   only.
+3. Bind it on the project version that should have a memory.
 
-Two projects that should share a memory get the same tenant; two that should not
-must not. There is no per-user or per-chat scope — Agent Studio passes only
-static headers, so the finest grain available is the project.
+To *share* one memory across projects — or point one version at a different
+bucket — set `X-Memory-Tenant` explicitly (on the entry, or as a per-version
+header override); an explicit tenant always wins over the automatic project
+name. There is no per-user or per-chat scope — the finest grain the headers
+carry is the project.
 
 ## Run
 

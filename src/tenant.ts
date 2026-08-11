@@ -22,6 +22,17 @@
 
 export const TENANT_HEADER = "x-memory-tenant";
 
+/**
+ * The generic tenant header, read when no explicit {@link TENANT_HEADER} is
+ * configured. Agent Studio stamps it on every MCP request with the calling
+ * project's name — which is what makes this server per-project there with no
+ * per-project registration at all — and the name is deliberately unbranded, so
+ * any client with the same convention scopes the same way. Explicit wins: an
+ * operator who set `x-memory-tenant` by hand has said which bucket this
+ * binding is, and the automatic name must not override that.
+ */
+export const TENANT_ID_HEADER = "x-tenant-id";
+
 /** Long enough for a repository-style name, short enough to keep S3 keys sane. */
 const MAX_LENGTH = 128;
 /**

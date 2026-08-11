@@ -140,6 +140,25 @@ describe("tools/list", () => {
     const { body } = await rpc("tools/list", undefined, { "x-memory-tenant": "../other" });
     assert.match(errorOf(body).message, /must start with a letter or digit/);
   });
+
+  it("reads the generic tenant header when no explicit tenant is set", async () => {
+    // Agent Studio stamps every MCP request with the calling project, so a
+    // binding there needs no per-project header registration at all.
+    const { body } = await rpc("tools/list", undefined, { "x-tenant-id": "painter" });
+    assert.equal(body.result.tools[0].name, "recall");
+  });
+
+  it("an explicit tenant wins over the project header", async () => {
+    // The operator who set x-memory-tenant by hand has said which bucket this
+    // binding is; the automatic name must not override that.
+    calls.length = 0;
+    await rpc(
+      "tools/call",
+      { name: "recall", arguments: { query: "x" } },
+      { "x-memory-tenant": "demo", "x-tenant-id": "painter" },
+    );
+    assert.equal(calls[0]?.tenant, "demo");
+  });
 });
 
 describe("tools/call", () => {

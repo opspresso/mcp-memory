@@ -16,7 +16,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { authorizes } from "./auth.js";
 import type { Config } from "./config.js";
 import { logError } from "./log.js";
-import { parseTenant, TENANT_HEADER, TenantError } from "./tenant.js";
+import { TENANT_ID_HEADER, parseTenant, TENANT_HEADER, TenantError } from "./tenant.js";
 import type { ToolDefinition, ToolResult } from "./tools.js";
 
 export const PROTOCOL_VERSION = "2025-06-18";
@@ -102,7 +102,9 @@ async function handle(deps: ServerDeps, request: IncomingMessage, message: JsonR
 
 function requireTenant(request: IncomingMessage): string {
   try {
-    return parseTenant(request.headers[TENANT_HEADER]);
+    return parseTenant(
+      request.headers[TENANT_HEADER] ?? request.headers[TENANT_ID_HEADER],
+    );
   } catch (error) {
     if (error instanceof TenantError) {
       throw new RpcError(INVALID_REQUEST, error.message);
