@@ -118,7 +118,7 @@ Worth knowing before you rely on it:
 | `PORT` | `3000` | |
 | `MCP_API_KEY` | unset | when set, every request must present it as a bearer token |
 | `STATS_FLUSH_MS` | `30000` | how often a pod pushes its counters |
-| `STATS_COMPACT_THRESHOLD` | `20` | how many shards *older than the lag* it takes before a reader folds them in |
+| `STATS_COMPACT_THRESHOLD` | `20` | a reader folds shards in once more than this many are *older than the lag* |
 
 All of it is validated before the port is bound, so a missing bucket name stops
 a rollout at the probe rather than surfacing inside somebody's agent run.
@@ -189,13 +189,16 @@ Compiled in rather than configurable, and written down here because a refused
 | `content` | 32,000 bytes |
 | `category` | 128 bytes |
 | `tags` | 20 entries, 64 bytes each |
-| `limit` on `recall` and `list_memories` | 1 – 50 |
+| `query` on `search_docs` | 1,000 characters |
+| `limit` on `recall`, `list_memories` and `search_docs` | 1 – 50 |
 
-Bytes rather than characters, because the ceiling underneath them is measured
-that way: 40 KB of metadata per vector, of which the filterable half — where
-`category` lands — is 2 KB. All of it is checked before anything is sent, so a
-model that overshoots is told which field to shorten instead of getting a size
-back from AWS that names neither the field nor the limit.
+Bytes rather than characters for the three that reach a vector, because the
+ceiling underneath them is measured that way: 40 KB of metadata per vector, of
+which the filterable half — where `category` lands — is 2 KB. The `search_docs`
+query is the exception, counted in characters because that is how the Retrieve
+API counts it. All of it is checked before anything is sent, so a model that
+overshoots is told which field to shorten instead of getting a size back from
+AWS that names neither the field nor the limit.
 
 `memory_stats` has a ceiling of its own: it counts index keys and stops at
 10,000, past which it reports a lower bound and says so.
@@ -314,6 +317,8 @@ Failures that reach a tool are also written to stderr as one JSON line each, so
 an outage shows up in the pod's logs and not only inside somebody's agent run.
 
 ## Develop
+
+Node 24 or newer — `package.json` requires it, and the image and CI both run it.
 
     npm install
     npm run dev          # tsx, no build step
