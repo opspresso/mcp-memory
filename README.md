@@ -359,3 +359,26 @@ S3 Vectors has no local emulator, so `src/testing/fakes.ts` stands in for both
 stores and for the embedder. Its similarity scale is harsher than a real model's
 — roughly the fraction of words two texts share — and fixtures have to be
 written for that; the file documents the measured numbers.
+
+### Releasing
+
+A release is a tag, and everything else follows from it: CI runs the checks,
+cuts a GitHub release whose notes are the commit subjects since the previous tag
+bar the release commit itself, pushes the image to ECR and GHCR, and dispatches
+to the GitOps repository, which is what puts it on alpha.
+
+```bash
+npm version 0.4.3 --no-git-tag-version
+git add package.json package-lock.json src/server.ts
+git commit -m "chore: release v0.4.3"
+git tag v0.4.3
+git push origin main v0.4.3
+```
+
+The version is written in three places — `package.json`, its lock file, and
+`SERVER_VERSION` in `src/server.ts`, which is what a client is told it connected
+to. `npm version` moves all three, the third through `scripts/sync-version.mjs`
+on npm's `version` hook, and the check in `src/server.test.ts` fails the build if
+they ever part company. `--no-git-tag-version` leaves the commit and the tag to
+the lines below it, so the history reads `chore: release …` rather than npm's
+bare version.
