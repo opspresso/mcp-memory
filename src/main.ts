@@ -13,12 +13,13 @@ import { describeAuth } from "./auth.js";
 import { ConfigError, loadConfig } from "./config.js";
 import { KnowledgeBaseRetriever, knowledgeBaseInvoker } from "./docs.js";
 import { BedrockEmbedder, bedrockInvoker, HttpEmbedder, type Embedder } from "./embeddings.js";
-import { createMcpServer, SERVER_NAME, SERVER_VERSION } from "./server.js";
+import { createMcpServer } from "./server.js";
 import { S3MemoryService } from "./service.js";
 import { createObjectStore } from "./store/objects.js";
 import { StatsTracker } from "./store/stats.js";
 import { createVectorStore } from "./store/vectors.js";
 import { gracefulShutdown } from "./shutdown.js";
+import { SERVER_NAME, SERVER_VERSION } from "./version.js";
 import { callTool, toolCatalogue } from "./tools.js";
 
 /**

@@ -1,0 +1,41 @@
+name: Verify
+
+# Separate from the release workflow, which only runs on a tag. Nothing checked
+# a pull request here before this existed, while auto-merge.yml is configured to
+# merge on an owner approval alone — so typecheck and the tests first ran after
+# the version had been bumped and the tag pushed, which is the most expensive
+# moment to learn they fail.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# Only the tip of a branch is being merged; a superseded run answers a question
+# nobody is still asking.
+concurrency:
+  group: "verify-${{ github.ref }}"
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+
+      # The image is what ships, and it has broken on its own in a sibling
+      # repository before — a build stage once lacked a tsconfig the build
+      # needed, and the tag build is where that surfaced. It builds from the
+      # same lock file `npm ci` just used, so this also catches a lock that
+      # resolves but does not compile.
+      - run: docker build -t mcp-memory:verify .
