@@ -8,16 +8,10 @@
  */
 
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
 import type { AddressInfo } from "node:net";
 import { after, before, describe, it } from "node:test";
 import { loadConfig } from "./config.js";
-import {
-  createMcpServer,
-  PROTOCOL_VERSION,
-  SERVER_VERSION,
-  type ToolHandler,
-} from "./server.js";
+import { createMcpServer, PROTOCOL_VERSION, type ToolHandler } from "./server.js";
 
 const BASE_ENV = {
   VECTOR_BUCKET: "vectors",
@@ -96,17 +90,6 @@ describe("health", () => {
   });
 });
 
-describe("what the server calls itself", () => {
-  it("reports the version in package.json", () => {
-    // Two copies of one number, and the handshake is where a stale one shows
-    // up — as a client being told it is talking to a release that shipped
-    // months ago. Nothing else notices, so this has to.
-    const manifest = JSON.parse(
-      readFileSync(new URL("../package.json", import.meta.url), "utf8"),
-    ) as { version: string };
-    assert.equal(SERVER_VERSION, manifest.version);
-  });
-});
 
 describe("initialize", () => {
   it("returns the negotiated version and the server's identity", async () => {

@@ -17,16 +17,10 @@ import { authorizes } from "./auth.js";
 import type { Config } from "./config.js";
 import { logError } from "./log.js";
 import { TENANT_ID_HEADER, parseTenant, TENANT_HEADER, TenantError } from "./tenant.js";
+import { SERVER_NAME, SERVER_VERSION } from "./version.js";
 import type { ToolDefinition, ToolResult } from "./tools.js";
 
 export const PROTOCOL_VERSION = "2025-06-18";
-export const SERVER_NAME = "mcp-memory";
-/**
- * Tracks `version` in package.json; both are what a client is told this is.
- * `npm version` keeps the two in step through `scripts/sync-version.mjs`, and
- * the check in `server.test.ts` is the backstop for a bump made some other way.
- */
-export const SERVER_VERSION = "0.4.2";
 /** A remembered body is capped well below this by the tools; this only bounds the frame. */
 const MAX_BODY_BYTES = 1024 * 1024;
 

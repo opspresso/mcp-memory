@@ -1,5 +1,10 @@
-node_modules
-dist
-.git
+# Not an optimisation — the Dockerfile COPYs files by name and src/ only. It is
+# a guard: the day a `COPY . .` appears, or a `.env` or a local `dist/` is
+# sitting in the working directory when the release workflow runs, this is what
+# keeps it out of an image that gets pushed to two registries.
+node_modules/
+dist/
+.git/
+.github/
+.env*
 *.log
-.DS_Store

@@ -12,7 +12,7 @@
     "dev": "tsx src/main.ts",
     "test": "node --import tsx --test \"src/**/*.test.ts\"",
     "typecheck": "tsc --noEmit",
-    "version": "node scripts/sync-version.mjs && git add src/server.ts"
+    "version": "node scripts/sync-version.mjs && git add src/version.ts"
   },
   "dependencies": {
     "@aws-sdk/client-bedrock-agent-runtime": "^3.1106.0",
