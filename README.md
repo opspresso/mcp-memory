@@ -333,10 +333,16 @@ Bedrock:
     POST /mcp      JSON-RPC; Authorization: Bearer <MCP_API_KEY> when a key is set
     GET  /health   liveness
 
-The protocol revision is `2025-06-18`, which removed JSON-RPC batching — a batch
-is refused out loud rather than taken for a notification and left unanswered. A
-body over 1 MiB stops being buffered and comes back 413. A `DELETE` answers 204:
-the server is stateless, so a session teardown has nothing to release.
+The protocol is served by `@modelcontextprotocol/server`, which answers **both
+eras from that one endpoint**: a client opening with `server/discover` gets
+revision `2026-07-28`, one opening with the `initialize` handshake is served
+statelessly as before. The server holds nothing between requests either way.
+
+The tenant header is this server's own, and it is read when a tool runs rather
+than when a client connects: the handshake says what this server is, which is
+true whoever is asking, so a client that connects lazily is not told about a
+header problem before it has asked for anything. A call without the header comes
+back as a tool error naming the header to set.
 
 AWS credentials come from the pod's role. Never bake keys into the image.
 Failures that reach a tool are also written to stderr as one JSON line each, so
