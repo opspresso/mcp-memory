@@ -346,10 +346,12 @@ an outage shows up in the pod's logs and not only inside somebody's agent run.
 
 Node 24 or newer — `package.json` requires it, and the image and CI both run it.
 
-    npm install
-    npm run dev          # tsx, no build step
-    npm run typecheck
-    npm test
+```bash
+npm install
+npm run dev          # tsx, no build step
+npm run typecheck
+npm test
+```
 
 `typecheck` + `test` are the checks; `build` is the third.
 
