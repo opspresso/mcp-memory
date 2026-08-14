@@ -78,6 +78,13 @@ A request with no tenant is refused rather than defaulted, and `tools/list` is
 refused too — so a missing header shows up the moment someone presses **Test
 connection**, rather than as a working test button and a broken run later.
 
+The value itself is held to at most 128 characters, starting with a letter or a
+digit and otherwise carrying only letters, digits, `.`, `_` and `-`. It lands in
+an S3 key path and in an S3 Vectors filter value, so what it may hold is the
+intersection of the two rather than what either would tolerate alone. A header
+sent twice is refused as well: which of the values was meant is not something to
+guess at when guessing wrong picks another project's memories.
+
 ## What it does not do
 
 Worth knowing before you rely on it:
@@ -90,7 +97,10 @@ Worth knowing before you rely on it:
   lever available. Adding `resources/*` support to Agent Studio would fix this
   properly, at the cost of a round trip on every run's first token.
 - **Counters are approximate.** A pod that dies before its next flush takes up
-  to `STATS_FLUSH_MS` of counts with it. They feed ranking and nothing else.
+  to `STATS_FLUSH_MS` of counts with it, and a pod re-reads the durable counts
+  only once a minute, so another pod's flush reaches this one's ranking that
+  much later — its own reads are counted immediately either way. They feed
+  ranking and nothing else.
 - **No automatic expiry.** S3 Vectors has no lifecycle rules, so nothing ages
   out on its own. `forget` is the only removal.
 - **No keyword matching.** A query naming something the embedding does not
@@ -201,7 +211,18 @@ overshoots is told which field to shorten instead of getting a size back from
 AWS that names neither the field nor the limit.
 
 `memory_stats` has a ceiling of its own: it counts index keys and stops at
-10,000, past which it reports a lower bound and says so.
+10,000, past which it reports a lower bound and says so. `search_docs` has one
+on the way out rather than in: an excerpt is cut at 2,000 characters, with a
+note saying so and pointing at the source. How large a chunk is belongs to the
+knowledge base's ingestion and not to this server, and a generously-chunked
+library could otherwise spend a run's context on a single call.
+
+Omitted arguments have compiled-in answers too. `recall` takes a mode —
+**precision** for few, closely-matching results, **balanced** (the default) for
+the usual trade-off, **exploratory** for more results on looser matching, which
+is what to reach for when a balanced search found nothing — and an omitted
+`limit` is whatever that mode allows: 3, 5 and 10 respectively. `list_memories`
+returns 20, and `search_docs` 5, the knowledge base's own default.
 
 ### Authentication has two modes
 
@@ -311,6 +332,11 @@ Bedrock:
 
     POST /mcp      JSON-RPC; Authorization: Bearer <MCP_API_KEY> when a key is set
     GET  /health   liveness
+
+The protocol revision is `2025-06-18`, which removed JSON-RPC batching — a batch
+is refused out loud rather than taken for a notification and left unanswered. A
+body over 1 MiB stops being buffered and comes back 413. A `DELETE` answers 204:
+the server is stateless, so a session teardown has nothing to release.
 
 AWS credentials come from the pod's role. Never bake keys into the image.
 Failures that reach a tool are also written to stderr as one JSON line each, so
