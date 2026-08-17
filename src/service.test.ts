@@ -39,14 +39,128 @@ beforeEach(() => {
   service = new S3MemoryService(vectors, objects, stats, new FakeEmbedder(), 0.3, () => clock);
 });
 
-function remember(content: string, extra: Partial<{ memoryType: "project" | "pattern" | "reference" | "conversation"; category: string; tags: string[] }> = {}) {
+function remember(
+  content: string,
+  extra: Partial<{
+    memoryType: "project" | "pattern" | "reference" | "conversation";
+    category: string;
+    tags: string[];
+    scope: "project" | "conversation";
+    conversation: string;
+  }> = {},
+) {
   return service.remember("alpha", {
     content,
     memoryType: extra.memoryType ?? "project",
     category: extra.category,
     tags: extra.tags ?? [],
+    ...(extra.scope ? { scope: extra.scope } : {}),
+    ...(extra.conversation ? { conversation: extra.conversation } : {}),
   });
 }
+
+describe("conversation scope", () => {
+  const THREAD = "slack:C1:1723.45";
+  const OTHER = "slack:C1:9999.99";
+
+  it("keeps a conversation's own note out of every other conversation's recall", async () => {
+    await remember("Keep answers short in this thread", { scope: "conversation", conversation: THREAD });
+    clock += 1000;
+    await remember("The deploy pipeline pushes to ECR then dispatches to ArgoCD", { conversation: THREAD });
+
+    const own = await service.recall("alpha", { query: "keep answers short in this thread", conversation: THREAD });
+    assert.match(own, /Keep answers short/);
+    assert.match(own, /this conversation only/);
+
+    const other = await service.recall("alpha", { query: "keep answers short in this thread", conversation: OTHER });
+    assert.doesNotMatch(other, /Keep answers short/);
+    const none = await service.recall("alpha", { query: "keep answers short in this thread" });
+    assert.doesNotMatch(none, /Keep answers short/);
+
+    // The project memory written from the thread is everyone's — provenance
+    // is recorded, visibility is not narrowed.
+    const shared = await service.recall("alpha", { query: "deploy pipeline pushes to ECR", conversation: OTHER });
+    assert.match(shared, /deploy pipeline pushes to ECR/);
+    assert.doesNotMatch(shared, /this conversation only/);
+  });
+
+  it("lists a thread its own notes and the project's, never another thread's", async () => {
+    await remember("Note for thread one", { scope: "conversation", conversation: THREAD });
+    clock += 1000;
+    await remember("Note for thread two", { scope: "conversation", conversation: OTHER });
+    clock += 1000;
+    await remember("Everyone's fact", {});
+
+    const one = await service.list("alpha", { limit: 20, conversation: THREAD });
+    assert.match(one, /Note for thread one/);
+    assert.match(one, /Everyone's fact/);
+    assert.doesNotMatch(one, /Note for thread two/);
+
+    const bare = await service.list("alpha", { limit: 20 });
+    assert.match(bare, /Everyone's fact/);
+    assert.doesNotMatch(bare, /Note for thread/);
+    assert.match(bare, /1 memories/);
+  });
+
+  it("fills a listing past another thread's notes rather than returning fewer than asked", async () => {
+    // Twenty-five of someone else's notes sit newest on the index; a listing of
+    // ten for a third party still finds its ten project memories behind them.
+    // Distinct sentences, or dedup merges them: the fake embedder scores by words.
+    const facts = [
+      "Deploys go through ArgoCD",
+      "Readiness probes answer during drain",
+      "Images push to ECR on a tag",
+      "Postgres holds the ledger",
+      "Grafana dashboards live in the addons repo",
+      "Secrets come from SSM parameters",
+      "The scheduler ticks once a minute",
+      "Traces keep bounded metadata",
+      "Usage rows expire after a year",
+      "Slack bots are per project",
+    ];
+    for (const fact of facts) {
+      await remember(fact, {});
+      clock += 1000;
+    }
+    const notes = [
+      "cats", "dogs", "birds", "fish", "trees", "rivers", "stones", "clouds", "winds", "hills",
+      "roads", "boats", "trains", "planes", "bikes", "books", "songs", "films", "games", "maps",
+      "keys", "locks", "doors", "walls", "roofs",
+    ];
+    for (const note of notes) {
+      await remember(`This thread likes ${note}`, { scope: "conversation", conversation: OTHER });
+      clock += 1000;
+    }
+
+    const listing = await service.list("alpha", { limit: 10, conversation: THREAD });
+    assert.match(listing, /10 memories/);
+    assert.doesNotMatch(listing, /This thread likes/);
+  });
+
+  it("does not let one thread's note stop another thread from writing the same fact", async () => {
+    await remember("Prefer bullet points", { scope: "conversation", conversation: THREAD });
+    clock += 1000;
+    const second = await remember("Prefer bullet points", { scope: "conversation", conversation: OTHER });
+    assert.match(second, /Stored as/);
+    assert.equal(vectors.size, 2);
+
+    // Within one thread the same note is still merged.
+    clock += 1000;
+    assert.match(await remember("Prefer bullet points", { scope: "conversation", conversation: THREAD }), /Already known/);
+    // And "already known" never points at a memory the caller cannot see.
+    clock += 1000;
+    const stored = await remember("Prefer bullet points", {});
+    assert.match(stored, /Stored as/);
+  });
+
+  it("forgets a conversation memory by id like any other, index entry included", async () => {
+    const result = await remember("Temporary note", { scope: "conversation", conversation: THREAD });
+    const id = /Stored as ([0-9A-Z]{26})/.exec(result)![1]!;
+    assert.match(await service.forget("alpha", id), /Deleted/);
+    assert.equal(vectors.size, 0);
+    assert.equal(await objects.list("index/alpha/", 100).then((keys) => keys.length), 0);
+  });
+});
 
 describe("remember", () => {
   it("stores a memory and reports the id it can be forgotten by", async () => {

@@ -82,7 +82,7 @@ const server = createMcpServer({
   config,
   tools: {
     definitions: () => catalogue,
-    call: (tenant, name, args) => callTool(service, tenant, name, args, docs),
+    call: (context, name, args) => callTool(service, context, name, args, docs),
   },
 });
 

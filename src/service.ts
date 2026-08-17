@@ -12,6 +12,7 @@
  * facts wrapped in braces and quotes.
  */
 
+import { conversationKeyPart } from "./conversation.js";
 import type { Embedder } from "./embeddings.js";
 import { invertedTime, ulid, ulidTime } from "./id.js";
 import { logError } from "./log.js";
@@ -30,7 +31,7 @@ import {
 import type { ObjectStore } from "./store/objects.js";
 import { StatsTracker } from "./store/stats.js";
 import type { VectorStore } from "./store/vectors.js";
-import type { MemoryType, RankedMemory, RecallMode, StoredMemory } from "./types.js";
+import type { MemoryScope, MemoryType, RankedMemory, RecallMode, StoredMemory } from "./types.js";
 import { MEMORY_TYPES } from "./types.js";
 
 /**
@@ -68,6 +69,8 @@ export interface RecallRequest {
   query: string;
   limit?: number;
   mode?: RecallMode;
+  /** The request's conversation, when it declared one — decides which scoped memories it may see. */
+  conversation?: string;
 }
 
 export interface RememberRequest {
@@ -75,11 +78,30 @@ export interface RememberRequest {
   memoryType: MemoryType;
   category?: string;
   tags: string[];
+  /** Defaults to `project`. `conversation` requires {@link RememberRequest.conversation}. */
+  scope?: MemoryScope;
+  /** Provenance on a project memory; the visibility key on a conversation one. */
+  conversation?: string;
 }
 
 export interface ListRequest {
   memoryType?: MemoryType;
   limit: number;
+  /** See {@link RecallRequest.conversation}. */
+  conversation?: string;
+}
+
+/**
+ * The visibility rule, in one place: a project memory is everyone's, a
+ * conversation memory is its own conversation's and nobody else's — a request
+ * in no conversation included. Recall, dedup and listing all read it, so the
+ * three cannot disagree about whose note a thread gets to see.
+ */
+export function visibleTo(
+  memory: Pick<StoredMemory, "scope" | "conversation">,
+  conversation: string | undefined,
+): boolean {
+  return memory.scope !== "conversation" || (!!conversation && memory.conversation === conversation);
 }
 
 export interface MemoryService {
@@ -99,16 +121,45 @@ export interface MemoryService {
  * count them by type. The key carries everything those two questions need, so
  * both are answered by listing keys without fetching a single body.
  */
-function indexKey(tenant: string, memory: Pick<StoredMemory, "id" | "memoryType">): string {
-  return `index/${tenant}/${invertedTime(ulidTime(memory.id))}#${memory.id}#${memory.memoryType}`;
+function indexKey(
+  tenant: string,
+  memory: Pick<StoredMemory, "id" | "memoryType" | "scope" | "conversation">,
+): string {
+  const base = `index/${tenant}/${invertedTime(ulidTime(memory.id))}#${memory.id}#${memory.memoryType}`;
+  // A conversation memory carries its conversation on the key — as a digest,
+  // since the value may hold the very characters this key splits on — so a
+  // listing can keep other threads' notes out without fetching a body to find
+  // out. A project memory's key is exactly what it always was.
+  return memory.scope === "conversation" && memory.conversation
+    ? `${base}#${conversationKeyPart(memory.conversation)}`
+    : base;
 }
 
-function parseIndexKey(key: string): { id: string; memoryType: string } | undefined {
+interface IndexEntry {
+  id: string;
+  memoryType: string;
+  /** The conversation digest a scoped memory's key carries; absent for a project memory. */
+  conversationKey?: string;
+}
+
+function parseIndexKey(key: string): IndexEntry | undefined {
   const parts = key.slice(key.lastIndexOf("/") + 1).split("#");
-  if (parts.length !== 3 || !parts[1] || !parts[2]) {
+  if ((parts.length !== 3 && parts.length !== 4) || !parts[1] || !parts[2]) {
     return undefined;
   }
-  return { id: parts[1], memoryType: parts[2] };
+  return {
+    id: parts[1],
+    memoryType: parts[2],
+    ...(parts.length === 4 && parts[3] ? { conversationKey: parts[3] } : {}),
+  };
+}
+
+/** Whether an index entry's memory may be listed to this conversation — the key-level half of {@link visibleTo}. */
+function entryVisibleTo(entry: IndexEntry, conversation: string | undefined): boolean {
+  return (
+    entry.conversationKey === undefined ||
+    (!!conversation && entry.conversationKey === conversationKeyPart(conversation))
+  );
 }
 
 function percent(value: number): string {
@@ -170,6 +221,9 @@ function day(iso: string): string {
 function render(memory: StoredMemory, position: number, standing?: number): string {
   const facets = [
     memory.category ? `${memory.memoryType}/${memory.category}` : memory.memoryType,
+    // Said, so the model knows a note is this thread's rather than the
+    // project's — it will only ever see its own thread's, but not why.
+    ...(memory.scope === "conversation" ? ["this conversation only"] : []),
     ...(standing === undefined ? [] : [`${percent(standing)} of the top result`]),
     `stored ${day(memory.createdAt)}`,
   ];
@@ -194,11 +248,13 @@ export class S3MemoryService implements MemoryService {
     const limit = request.limit ?? config.limit;
 
     const embedding = await this.embedder.embed(request.query);
-    const hits = await this.vectors.query(
-      tenant,
-      embedding,
-      Math.min(CANDIDATE_CAP, Math.max(30, limit * 3)),
-    );
+    // Visibility is applied here, after the store answered and before anything
+    // is ranked or rendered — the store's filter stays the one tenant key it has
+    // always been, and another thread's note never reaches the model, not even
+    // as a gated-out count. Nothing here may widen the store's own filter.
+    const hits = (
+      await this.vectors.query(tenant, embedding, Math.min(CANDIDATE_CAP, Math.max(30, limit * 3)))
+    ).filter((hit) => visibleTo(hit.memory, request.conversation));
 
     if (hits.length === 0) {
       return [
@@ -311,7 +367,14 @@ export class S3MemoryService implements MemoryService {
     // Two gates, and the second is not a refinement of the first. The cosine is
     // the embedding model's judgement; the wording is the texts' own. Declining
     // to write loses a fact silently, so it takes both.
-    const [nearest] = await this.vectors.query(tenant, embedding, 1);
+    // Nearest *visible* neighbour: a fact one thread keeps to itself must not
+    // stop another thread — or the project — from writing the same fact, and
+    // "already known" must never point at a memory the caller cannot see. A
+    // handful of neighbours rather than one, since the closest may be someone
+    // else's.
+    const [nearest] = (await this.vectors.query(tenant, embedding, 5)).filter((hit) =>
+      visibleTo(hit.memory, request.conversation),
+    );
     if (
       nearest &&
       nearest.similarity >= DEDUP_THRESHOLD &&
@@ -337,6 +400,10 @@ export class S3MemoryService implements MemoryService {
       category: request.category,
       tags: request.tags,
       createdAt: new Date(at).toISOString(),
+      ...(request.scope === "conversation" ? { scope: "conversation" as const } : {}),
+      // Provenance for a project memory, the visibility key for a conversation
+      // one — recorded either way when the request said which conversation.
+      ...(request.conversation ? { conversation: request.conversation } : {}),
       trustBase: TRUST_MANUAL,
     };
 
@@ -366,7 +433,12 @@ export class S3MemoryService implements MemoryService {
     const byId = new Map(found.map((memory) => [memory.id, memory]));
     const ordered = entries
       .map((entry) => byId.get(entry.id))
-      .filter((memory): memory is StoredMemory => memory !== undefined);
+      // The key already kept other threads' notes out; the body is checked
+      // again because it is the record and the key is a listing artefact.
+      .filter(
+        (memory): memory is StoredMemory =>
+          memory !== undefined && visibleTo(memory, request.conversation),
+      );
 
     return [
       `[MEMORY] ${ordered.length} memories, newest first.`,
@@ -385,16 +457,14 @@ export class S3MemoryService implements MemoryService {
    * project whose recent memories are mostly of other types. So it pages until
    * it has enough or the prefix runs out.
    */
-  private async recentEntries(
-    tenant: string,
-    request: ListRequest,
-  ): Promise<{ id: string; memoryType: string }[]> {
+  private async recentEntries(tenant: string, request: ListRequest): Promise<IndexEntry[]> {
     const prefix = `index/${tenant}/`;
-    const found: { id: string; memoryType: string }[] = [];
+    const found: IndexEntry[] = [];
     let after: string | undefined;
-    // Unfiltered, the first `limit` keys are already the answer, so there is no
-    // reason to pull a full page and throw most of it away.
-    const pageSize = request.memoryType ? PAGE_SIZE : request.limit;
+    // Only a request in no conversation, asking for no type, can take the first
+    // `limit` keys as the answer: a type filter and another thread's scoped
+    // notes both sit at the end of the key, so either may thin a page.
+    const pageSize = request.memoryType || request.conversation ? PAGE_SIZE : request.limit;
 
     while (found.length < request.limit) {
       const page = await this.objects.list(prefix, pageSize, after);
@@ -403,7 +473,11 @@ export class S3MemoryService implements MemoryService {
       }
       for (const key of page) {
         const entry = parseIndexKey(key);
-        if (entry && (!request.memoryType || entry.memoryType === request.memoryType)) {
+        if (
+          entry &&
+          entryVisibleTo(entry, request.conversation) &&
+          (!request.memoryType || entry.memoryType === request.memoryType)
+        ) {
           found.push(entry);
           if (found.length === request.limit) {
             break;

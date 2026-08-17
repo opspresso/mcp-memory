@@ -16,6 +16,25 @@ export function isMemoryType(value: unknown): value is MemoryType {
   return typeof value === "string" && (MEMORY_TYPES as readonly string[]).includes(value);
 }
 
+/**
+ * Who a memory is for. `project` (the default, and what every memory written
+ * before scopes existed is) is shared by every conversation of the tenant;
+ * `conversation` is visible only where the same `X-Conversation-Id` asks —
+ * a thread's working notes, a preference stated in one chat.
+ *
+ * Distinct from `MemoryType`, which says what *kind* of fact a memory is. The
+ * `conversation` type predates this and means "something the user said, kept
+ * for the project" — a type, not a visibility. The two are orthogonal on
+ * purpose: a `pattern` may be thread-local, a `conversation`-typed fact may be
+ * project-wide.
+ */
+export const MEMORY_SCOPES = ["project", "conversation"] as const;
+export type MemoryScope = (typeof MEMORY_SCOPES)[number];
+
+export function isMemoryScope(value: unknown): value is MemoryScope {
+  return typeof value === "string" && (MEMORY_SCOPES as readonly string[]).includes(value);
+}
+
 /** The immutable half: what `PutVectors` wrote, and what `QueryVectors` gives back. */
 export interface StoredMemory {
   id: string;
@@ -25,6 +44,16 @@ export interface StoredMemory {
   category?: string;
   tags: string[];
   createdAt: string;
+  /**
+   * Who may see it. Absent means `project` — the value every memory had before
+   * scopes existed, so nothing stored earlier changes meaning.
+   */
+  scope?: MemoryScope;
+  /**
+   * The conversation the request that wrote it was in, when it declared one.
+   * Provenance on a project memory; the visibility key on a conversation one.
+   */
+  conversation?: string;
   /**
    * Trust before decay. Fixed at write time by how the memory was come by, and
    * never rewritten — the decay that makes it fall in the ranking is computed

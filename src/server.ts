@@ -22,7 +22,7 @@ import { toNodeHandler } from "@modelcontextprotocol/node";
 import { authorizes } from "./auth.js";
 import type { Config } from "./config.js";
 import { logError } from "./log.js";
-import { buildServer, tenantOf, type ToolHandler } from "./mcp.js";
+import { buildServer, contextOf, type ToolHandler } from "./mcp.js";
 
 /** This server's own JSON-RPC code for auth, matching the siblings' choice. */
 const UNAUTHORIZED = -32001;
@@ -45,7 +45,7 @@ export function createMcpServer(deps: ServerDeps): Server {
     // anywhere else it would have to be threaded back down through the SDK,
     // and the only place to put it would be a module-level variable — which
     // two concurrent callers would share.
-    createMcpHandler(({ requestInfo }) => buildServer(deps.tools, () => tenantOf(requestInfo)), {
+    createMcpHandler(({ requestInfo }) => buildServer(deps.tools, () => contextOf(requestInfo)), {
       onerror: (error) => logError("mcp_handler_failed", error, {}),
     }),
   );

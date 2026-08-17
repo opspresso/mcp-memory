@@ -16,7 +16,16 @@
 
 import { renderDocs, type DocsRetriever } from "./docs.js";
 import { elapsedMs, logError, logInfo } from "./log.js";
-import { isMemoryType, isRecallMode, MEMORY_TYPES, type MemoryType } from "./types.js";
+import type { RequestContext } from "./mcp.js";
+import {
+  isMemoryScope,
+  isMemoryType,
+  isRecallMode,
+  MEMORY_SCOPES,
+  MEMORY_TYPES,
+  type MemoryScope,
+  type MemoryType,
+} from "./types.js";
 import { MAX_CONTENT_BYTES } from "./store/vectors.js";
 import { STATS_SCAN_CAP, type MemoryService } from "./service.js";
 
@@ -55,7 +64,9 @@ export const TOOLS: readonly ToolDefinition[] = [
       "decisions, conventions and setup steps from earlier sessions are stored here and " +
       "will not be in your context otherwise. Returns the memories themselves, ranked, " +
       "with a confidence level — not a summary. An empty result means nothing was stored " +
-      "on the subject, which is not the same as the subject having no answer.",
+      "on the subject, which is not the same as the subject having no answer. What comes " +
+      "back is the project's shared memory plus whatever was remembered for this " +
+      "conversation in particular; other conversations' own notes are never included.",
     inputSchema: {
       type: "object",
       properties: {
@@ -80,10 +91,12 @@ export const TOOLS: readonly ToolDefinition[] = [
     description:
       "Store something worth knowing in a later session. Use it for durable facts — an " +
       "architectural decision and its reason, a convention this project follows, a command " +
-      "that turned out to be the right one. Do not use it for the current conversation's " +
-      "working state, which does not outlive the run. Content near-identical to something " +
-      "already stored is not written a second time: you are told which memory already says " +
-      "it, and the tags and category you passed are discarded along with the rest.",
+      "that turned out to be the right one. Content near-identical to something already " +
+      "stored is not written a second time: you are told which memory already says it, and " +
+      "the tags and category you passed are discarded along with the rest. By default a " +
+      "memory is the project's, seen by every conversation; pass scope \"conversation\" for " +
+      "something that belongs to this thread alone — a preference the user stated here, a " +
+      "working note — which only this conversation will ever recall or list.",
     inputSchema: {
       type: "object",
       properties: {
@@ -92,6 +105,14 @@ export const TOOLS: readonly ToolDefinition[] = [
           description:
             "The fact itself, written so it still makes sense months later with none of " +
             "this conversation around it.",
+        },
+        scope: {
+          type: "string",
+          enum: [...MEMORY_SCOPES],
+          description:
+            "project (default): shared by every conversation of this project. conversation: " +
+            "kept for this conversation only, invisible everywhere else. Needs a conversation " +
+            "on the request — the platform sends one for chats, Slack threads and A2A calls.",
         },
         type: {
           type: "string",
@@ -119,7 +140,8 @@ export const TOOLS: readonly ToolDefinition[] = [
     name: "list_memories",
     description:
       "List this project's memories newest first, without searching. Use it to see what is " +
-      "stored when you do not have a query — for a search by meaning, use recall.",
+      "stored when you do not have a query — for a search by meaning, use recall. Includes " +
+      "this conversation's own memories and excludes other conversations'.",
     inputSchema: {
       type: "object",
       properties: {
@@ -218,6 +240,17 @@ function optionalType(args: Record<string, unknown>): MemoryType | undefined {
   return value;
 }
 
+function optionalScope(args: Record<string, unknown>): MemoryScope {
+  const value = args.scope;
+  if (value === undefined || value === null) {
+    return "project";
+  }
+  if (!isMemoryScope(value)) {
+    throw new ArgumentError(`\`scope\` must be one of: ${MEMORY_SCOPES.join(", ")}.`);
+  }
+  return value;
+}
+
 function optionalTags(args: Record<string, unknown>): string[] {
   const value = args.tags;
   if (value === undefined || value === null) {
@@ -263,20 +296,28 @@ function failure(body: string): ToolResult {
  */
 export async function callTool(
   service: MemoryService,
-  tenant: string,
+  context: RequestContext,
   name: string,
   args: Record<string, unknown>,
   docs?: DocsRetriever,
 ): Promise<ToolResult> {
   const started = performance.now();
-  const result = await dispatch(service, tenant, name, args, docs);
-  logInfo("tool_call", { tenant, tool: name, ms: elapsedMs(started), ok: result.isError !== true });
+  const result = await dispatch(service, context, name, args, docs);
+  // Whether the request was in a conversation, never which: the value is a
+  // thread address the caller owns, and `log.ts` keeps those out.
+  logInfo("tool_call", {
+    tenant: context.tenant,
+    tool: name,
+    ms: elapsedMs(started),
+    ok: result.isError !== true,
+    inConversation: context.conversation !== undefined,
+  });
   return result;
 }
 
 async function dispatch(
   service: MemoryService,
-  tenant: string,
+  { tenant, conversation }: RequestContext,
   name: string,
   args: Record<string, unknown>,
   docs?: DocsRetriever,
@@ -293,6 +334,7 @@ async function dispatch(
             query: requireString(args, "query"),
             limit: optionalLimit(args, undefined),
             mode: isRecallMode(mode) ? mode : undefined,
+            conversation,
           }),
         );
       }
@@ -319,12 +361,26 @@ async function dispatch(
               "'decision' or 'convention' — put the detail in `content`.",
           );
         }
+        const scope = optionalScope(args);
+        // The scope is the model's choice; the conversation it scopes to is not.
+        // Asked to keep something for "this conversation" on a request that is
+        // in none, the honest answer is a refusal naming what is missing — not
+        // a silent promotion to the project, which would put a thread's note in
+        // front of every other thread.
+        if (scope === "conversation" && !conversation) {
+          throw new ArgumentError(
+            "`scope` is \"conversation\" but this request is not in one — no X-Conversation-Id " +
+              "reached the server. Store it for the project instead, or leave `scope` unset.",
+          );
+        }
         return text(
           await service.remember(tenant, {
             content,
             memoryType: optionalType(args) ?? "project",
             category: typeof category === "string" ? category.trim() || undefined : undefined,
             tags: optionalTags(args),
+            scope,
+            conversation,
           }),
         );
       }
@@ -333,6 +389,7 @@ async function dispatch(
           await service.list(tenant, {
             memoryType: optionalType(args),
             limit: optionalLimit(args, 20) ?? 20,
+            conversation,
           }),
         );
       case "forget":

@@ -25,7 +25,7 @@ import {
   S3VectorsClient,
 } from "@aws-sdk/client-s3vectors";
 import type { StoredMemory } from "../types.js";
-import { isMemoryType } from "../types.js";
+import { isMemoryScope, isMemoryType } from "../types.js";
 
 /**
  * Total metadata per vector is capped at 40 KB by the service. This is the
@@ -160,6 +160,11 @@ export function toMetadata(memory: StoredMemory): Record<string, MetadataValue> 
     tenantId: memory.tenantId,
     memoryType: memory.memoryType,
     ...(memory.category ? { category: memory.category } : {}),
+    // Absent for `project`, so a memory written before scopes existed and one
+    // written after read the same. `conversation` is at most 512 ASCII bytes
+    // and shares the 2 KB filterable half — the budget check below counts it.
+    ...(memory.scope === "conversation" ? { scope: memory.scope } : {}),
+    ...(memory.conversation ? { conversation: memory.conversation } : {}),
     // Non-filterable, declared at index creation.
     content: memory.content,
     createdAt: memory.createdAt,
@@ -206,6 +211,10 @@ export function fromMetadata(key: string, metadata: unknown): StoredMemory | und
     category: typeof raw.category === "string" ? raw.category : undefined,
     tags: Array.isArray(raw.tags) ? raw.tags.filter((t): t is string => typeof t === "string") : [],
     createdAt: readTimestamp(raw.createdAt) ?? new Date(0).toISOString(),
+    ...(isMemoryScope(raw.scope) && raw.scope !== "project" ? { scope: raw.scope } : {}),
+    ...(typeof raw.conversation === "string" && raw.conversation
+      ? { conversation: raw.conversation }
+      : {}),
     trustBase: typeof raw.trustBase === "number" ? raw.trustBase : 1,
   };
 }
