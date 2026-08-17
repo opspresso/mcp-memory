@@ -345,8 +345,16 @@ header problem before it has asked for anything. A call without the header comes
 back as a tool error naming the header to set.
 
 AWS credentials come from the pod's role. Never bake keys into the image.
-Failures that reach a tool are also written to stderr as one JSON line each, so
-an outage shows up in the pod's logs and not only inside somebody's agent run.
+
+The process logs one JSON line per event. Every tool call leaves a `tool_call`
+line on stdout — the tool, the tenant, how long it took and whether it answered
+(`ok`) — and a failure that reaches a tool is written to stderr as well, so an
+outage shows up in the pod's logs and not only inside somebody's agent run.
+Neither carries memory content or a recall query: a failing dependency is
+identified by the tool and the tenant, not by what was being remembered.
+
+    {"level":"info","event":"tool_call","tenant":"demo","tool":"recall","ms":312,"ok":true}
+    {"level":"error","event":"tool_failed","message":"…","tenant":"demo","tool":"recall"}
 
 ## Develop
 

@@ -8,7 +8,7 @@
  */
 
 import assert from "node:assert/strict";
-import { describe, it } from "node:test";
+import { describe, it, mock } from "node:test";
 import type { DocsRetriever } from "./docs.js";
 import type { MemoryService } from "./service.js";
 import { MAX_CONTENT_BYTES } from "./store/vectors.js";
@@ -275,5 +275,50 @@ describe("failures", () => {
 
   it("rejects a tool it does not have", async () => {
     assert.equal((await call("drop_everything", {})).isError, true);
+  });
+});
+
+describe("the log", () => {
+  /** The `tool_call` lines written while `run` executes, parsed. */
+  async function linesDuring(run: () => Promise<unknown>): Promise<Record<string, unknown>[]> {
+    const write = mock.method(console, "log", () => {});
+    try {
+      await run();
+      return write.mock.calls
+        .map((call) => JSON.parse(String(call.arguments[0])) as Record<string, unknown>)
+        .filter((line) => line.event === "tool_call");
+    } finally {
+      write.mock.restore();
+    }
+  }
+
+  it("writes one line per call, naming the tool and the tenant", async () => {
+    const lines = await linesDuring(() => call("recall", { query: "how do we deploy" }));
+    assert.equal(lines.length, 1);
+    const [line] = lines;
+    assert.equal(line?.level, "info");
+    assert.equal(line?.tool, "recall");
+    assert.equal(line?.tenant, "demo");
+    assert.equal(line?.ok, true);
+    assert.equal(typeof line?.ms, "number");
+  });
+
+  it("never carries what was asked or remembered", async () => {
+    const lines = await linesDuring(async () => {
+      await call("recall", { query: "the secret query" });
+      await call("remember", { content: "the secret fact", tags: ["secret-tag"] });
+    });
+    assert.equal(lines.length, 2);
+    const written = JSON.stringify(lines);
+    assert.doesNotMatch(written, /secret/);
+  });
+
+  it("marks a refusal and a failure alike as not ok", async () => {
+    const [refused] = await linesDuring(() => call("recall", { limit: 3 }));
+    assert.equal(refused?.ok, false);
+    const [failed] = await linesDuring(() =>
+      callTool(failing, "demo", "recall", { query: "x" }),
+    );
+    assert.equal(failed?.ok, false);
   });
 });

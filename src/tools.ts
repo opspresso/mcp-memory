@@ -15,7 +15,7 @@
  */
 
 import { renderDocs, type DocsRetriever } from "./docs.js";
-import { logError } from "./log.js";
+import { elapsedMs, logError, logInfo } from "./log.js";
 import { isMemoryType, isRecallMode, MEMORY_TYPES, type MemoryType } from "./types.js";
 import { MAX_CONTENT_BYTES } from "./store/vectors.js";
 import { STATS_SCAN_CAP, type MemoryService } from "./service.js";
@@ -255,8 +255,26 @@ function failure(body: string): ToolResult {
  * `isError`, not as a protocol error: it is the model's problem to react to —
  * by fixing the argument or by carrying on without the memory — and a protocol
  * error would fail the whole run over it.
+ *
+ * Every call leaves one line behind, whatever the outcome — the tool, the
+ * tenant, how long it took and whether it answered. Not the arguments: what
+ * was asked or remembered is the caller's, and `log.ts` says why it never
+ * reaches a log line.
  */
 export async function callTool(
+  service: MemoryService,
+  tenant: string,
+  name: string,
+  args: Record<string, unknown>,
+  docs?: DocsRetriever,
+): Promise<ToolResult> {
+  const started = performance.now();
+  const result = await dispatch(service, tenant, name, args, docs);
+  logInfo("tool_call", { tenant, tool: name, ms: elapsedMs(started), ok: result.isError !== true });
+  return result;
+}
+
+async function dispatch(
   service: MemoryService,
   tenant: string,
   name: string,
