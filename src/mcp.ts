@@ -32,14 +32,25 @@
 
 import { fromJsonSchema, McpServer, type CallToolResult } from "@modelcontextprotocol/server";
 import { AjvJsonSchemaValidator } from "@modelcontextprotocol/server/validators/ajv";
+import { CONVERSATION_ID_HEADER, parseConversation } from "./conversation.js";
 import { TENANT_HEADER, TENANT_ID_HEADER, parseTenant } from "./tenant.js";
 import { SERVER_NAME, SERVER_VERSION } from "./version.js";
 import type { ToolDefinition, ToolResult } from "./tools.js";
 
+/**
+ * Whose memories a request may touch, and — when the caller said — which
+ * conversation it is in. Both come off headers the platform stamps; neither is
+ * ever a tool argument.
+ */
+export interface RequestContext {
+  tenant: string;
+  conversation?: string;
+}
+
 /** What the protocol layer needs from the tool layer, and nothing more. */
 export interface ToolHandler {
   definitions(): readonly ToolDefinition[];
-  call(tenant: string, name: string, args: Record<string, unknown>): Promise<ToolResult>;
+  call(context: RequestContext, name: string, args: Record<string, unknown>): Promise<ToolResult>;
 }
 
 /** One validator for every tool: compiling per registration would repeat the work. */
@@ -62,10 +73,26 @@ export function tenantOf(request: Request | undefined): string {
 }
 
 /**
- * A server for one request. `tenant` is a getter rather than a value so the
- * header is only required once a tool is actually called — see the note above.
+ * The request's context: its tenant, and its conversation when it declared one.
+ *
+ * `Headers.get` folds a repeated header into one comma-joined value, so the
+ * "sent more than once" refusal both parsers carry cannot fire from here — a
+ * doubled conversation header reads as one value with a comma in it, which the
+ * character rule then refuses for the comma. Same outcome, different sentence.
+ *
+ * @throws {TenantError|ConversationError} which the caller turns into a
+ * refusal naming the header.
  */
-export function buildServer(tools: ToolHandler, tenant: () => string): McpServer {
+export function contextOf(request: Request | undefined): RequestContext {
+  const conversation = parseConversation(request?.headers.get(CONVERSATION_ID_HEADER) ?? undefined);
+  return { tenant: tenantOf(request), ...(conversation ? { conversation } : {}) };
+}
+
+/**
+ * A server for one request. `context` is a getter rather than a value so the
+ * headers are only required once a tool is actually called — see the note above.
+ */
+export function buildServer(tools: ToolHandler, context: () => RequestContext): McpServer {
   const server = new McpServer({ name: SERVER_NAME, version: SERVER_VERSION });
   for (const tool of tools.definitions()) {
     server.registerTool(
@@ -81,7 +108,7 @@ export function buildServer(tools: ToolHandler, tenant: () => string): McpServer
       // this repository's own `{ content, isError? }`, which is a
       // CallToolResult — but not the whole union the SDK's callback may return.
       async (args) =>
-        tools.call(tenant(), tool.name, args as Record<string, unknown>) as Promise<CallToolResult>,
+        tools.call(context(), tool.name, args as Record<string, unknown>) as Promise<CallToolResult>,
     );
   }
   return server;

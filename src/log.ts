@@ -34,6 +34,8 @@ export interface LogContext {
   ms?: number;
   /** Whether the tool answered, or refused with `isError`. */
   ok?: boolean;
+  /** Whether the request declared a conversation — never which one. */
+  inConversation?: boolean;
 }
 
 function messageOf(error: unknown): string {

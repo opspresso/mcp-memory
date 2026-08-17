@@ -5,7 +5,7 @@ An MCP server that gives an Agent Studio project a memory that outlives a run.
 | Tool | Takes | Returns |
 |---|---|---|
 | `recall(query, limit?, mode?)` | a question in natural language | matching memories, ranked, with a confidence level |
-| `remember(content, type?, category?, tags?)` | a fact worth keeping | the id it was stored under, or the existing one that already said it |
+| `remember(content, type?, category?, tags?, scope?)` | a fact worth keeping — for the project, or with `scope: "conversation"` for this conversation alone | the id it was stored under, or the existing one that already said it |
 | `list_memories(type?, limit?)` | — | this project's memories, newest first |
 | `forget(id)` | an id from `recall` | confirmation, or that no such memory exists |
 | `memory_stats()` | — | how many memories there are, by type; a lower bound past 10,000 |
@@ -54,11 +54,14 @@ so any write that lands within a minute of being stamped is still counted.
 ```
 s3://<VECTOR_BUCKET>/                      (S3 Vectors)
   index "memories"                          key: <tenant>#<ulid>
-                                            filterable:     tenantId, memoryType, category
+                                            filterable:     tenantId, memoryType, category,
+                                                            scope (only "conversation"), conversation
                                             non-filterable: content, createdAt, tags, trustBase
 
 s3://<STATE_BUCKET>/
-  index/<tenant>/<invertedTime>#<ulid>#<type>    empty; the key is the whole record
+  index/<tenant>/<invertedTime>#<ulid>#<type>[#<conversationDigest>]
+                                                 empty; the key is the whole record —
+                                                 the digest only on a conversation-scoped memory
   stats/<tenant>/shard/<ulid>-<podId>.json      one pod-flush of counter deltas
   stats/<tenant>/merged.json                    folded counters + watermark
 ```
@@ -85,17 +88,57 @@ intersection of the two rather than what either would tolerate alone. A header
 sent twice is refused as well: which of the values was meant is not something to
 guess at when guessing wrong picks another project's memories.
 
+### And which conversation is asking
+
+A second header rides beside the tenant when the caller is in a conversation:
+`X-Conversation-Id`, which AgentDure stamps on every MCP request a run makes
+from a chat (`chat:{id}`), a Slack thread (`slack:{channel}:{thread}`), an
+inbound A2A call (`a2a:{client}:{contextId}`) or an API caller that declared
+one (`api:{caller}:{id}`). Same rules for the same reason: from a header, never
+from a tool argument, so a model cannot name a conversation it is not in.
+
+What it changes:
+
+- **`remember` takes a `scope`.** `project` (the default, and what every memory
+  written before scopes existed is) is shared by every conversation of the
+  tenant. `conversation` is this conversation's alone — a preference stated in
+  one thread, a working note — and is recalled, listed and de-duplicated only
+  where the same `X-Conversation-Id` asks. Asking for it on a request that is in
+  no conversation is refused by name, never silently filed under the project.
+- **A project memory written from a conversation records which one**, as
+  provenance. Its visibility is not narrowed.
+- **`recall` and `list_memories` answer with the project's memories plus this
+  conversation's own.** Another conversation's scoped notes never reach the
+  model — not in the results, not in the "gated out" count, and not as the
+  "already known" answer to a `remember`. The store's own filter stays the one
+  tenant key it has always been; visibility is applied on the way out.
+
+The header is optional. A request without one — a probe, a **Test connection**,
+a webhook firing, an API call that declared no conversation — reads and writes
+project memories exactly as before, and simply cannot see or write
+conversation-scoped ones. A malformed one (whitespace, non-ASCII, over 512
+characters, sent twice) is refused rather than read as "no conversation".
+
+Two things the key deliberately is not. It is not a *person*: the same thread
+may hold several people, and a note kept for it is kept for the thread. And it
+is not a ranking signal: a project memory recalled from the conversation that
+stored it scores exactly as it does anywhere else — provenance is recorded,
+never weighed.
+
 ## What it does not do
 
 Worth knowing before you rely on it:
 
-- **Nothing is injected before a run.** A memory server would ideally put what
-  it knows into the model's context *before* the first token, with no tool call
-  to pay for — which is what MCP *resources* are for. Agent Studio reads
-  `tools/list` and `tools/call` and nothing else, so there is no channel for it.
-  The `recall` description asks the model to call it early, which is the only
-  lever available. Adding `resources/*` support to Agent Studio would fix this
-  properly, at the cost of a round trip on every run's first token.
+- **Nothing is injected by this server before a run.** A memory server would
+  ideally put what it knows into the model's context *before* the first token,
+  with no tool call to pay for — which is what MCP *resources* are for, and
+  Agent Studio reads `tools/list` and `tools/call` and nothing else. What
+  exists instead lives on the platform's side: a version that opts into
+  `memoryRecall` has the *run* call `recall` with the newest user turn before
+  the first token and put the answer in the system prompt. From here that is an
+  ordinary `recall` — one call per run, with the run's tenant and conversation
+  on it — and the `recall` description still asks the model to call it early
+  for the versions that did not opt in.
 - **Counters are approximate.** A pod that dies before its next flush takes up
   to `STATS_FLUSH_MS` of counts with it, and a pod re-reads the durable counts
   only once a minute, so another pod's flush reaches this one's ranking that

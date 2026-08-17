@@ -46,9 +46,9 @@ const failing: MemoryService = {
   stats: async () => "",
 };
 
-function call(name: string, args: Record<string, unknown>) {
+function call(name: string, args: Record<string, unknown>, conversation?: string) {
   seen.length = 0;
-  return callTool(service, "demo", name, args);
+  return callTool(service, { tenant: "demo", ...(conversation ? { conversation } : {}) }, name, args);
 }
 
 describe("tool definitions", () => {
@@ -90,12 +90,12 @@ describe("tool definitions", () => {
 describe("recall", () => {
   it("applies the defaults the mode implies", async () => {
     assert.equal((await call("recall", { query: "x" })).content[0]?.text, "recalled");
-    assert.deepEqual(seen[0], { query: "x", limit: undefined, mode: undefined });
+    assert.deepEqual(seen[0], { query: "x", limit: undefined, mode: undefined, conversation: undefined });
   });
 
   it("passes a valid mode and limit through", async () => {
     await call("recall", { query: "x", mode: "precision", limit: 3 });
-    assert.deepEqual(seen[0], { query: "x", limit: 3, mode: "precision" });
+    assert.deepEqual(seen[0], { query: "x", limit: 3, mode: "precision", conversation: undefined });
   });
 
   it("refuses an unknown mode", async () => {
@@ -126,7 +126,44 @@ describe("remember", () => {
       memoryType: "project",
       category: undefined,
       tags: [],
+      scope: "project",
+      conversation: undefined,
     });
+  });
+
+  it("scopes a memory to the request's conversation, and only when there is one", async () => {
+    await call("remember", { content: "keep answers short here", scope: "conversation" }, "slack:C1:1.0");
+    assert.deepEqual(seen[0], {
+      content: "keep answers short here",
+      memoryType: "project",
+      category: undefined,
+      tags: [],
+      scope: "conversation",
+      conversation: "slack:C1:1.0",
+    });
+
+    // A project memory written from a conversation still records which one.
+    await call("remember", { content: "deploys go through ArgoCD" }, "slack:C1:1.0");
+    assert.equal((seen[0] as { scope: string; conversation?: string }).scope, "project");
+    assert.equal((seen[0] as { conversation?: string }).conversation, "slack:C1:1.0");
+
+    // Asked for a thread-local memory on a request in no thread: refused by
+    // name, never silently promoted to the project.
+    const refused = await call("remember", { content: "x", scope: "conversation" });
+    assert.equal(refused.isError, true);
+    assert.match(refused.content[0]!.text, /X-Conversation-Id/);
+    assert.equal(seen.length, 0);
+
+    const bad = await call("remember", { content: "x", scope: "thread" });
+    assert.equal(bad.isError, true);
+    assert.match(bad.content[0]!.text, /`scope` must be one of/);
+  });
+
+  it("hands recall and list the request's conversation", async () => {
+    await call("recall", { query: "x" }, "chat:c1");
+    assert.equal((seen[0] as { conversation?: string }).conversation, "chat:c1");
+    await call("list_memories", {}, "chat:c1");
+    assert.equal((seen[0] as { conversation?: string }).conversation, "chat:c1");
   });
 
   it("normalises tags and drops the empty ones", async () => {
@@ -189,12 +226,12 @@ describe("remember", () => {
 describe("list_memories and forget", () => {
   it("defaults the list limit to 20", async () => {
     await call("list_memories", {});
-    assert.deepEqual(seen[0], { memoryType: undefined, limit: 20 });
+    assert.deepEqual(seen[0], { memoryType: undefined, limit: 20, conversation: undefined });
   });
 
   it("passes a type filter through", async () => {
     await call("list_memories", { type: "pattern", limit: 5 });
-    assert.deepEqual(seen[0], { memoryType: "pattern", limit: 5 });
+    assert.deepEqual(seen[0], { memoryType: "pattern", limit: 5, conversation: undefined });
   });
 
   it("requires an id to forget", async () => {
@@ -215,7 +252,7 @@ describe("search_docs", () => {
 
   function search(args: Record<string, unknown>, docs: DocsRetriever = retriever) {
     docsSeen.length = 0;
-    return callTool(service, "demo", "search_docs", args, docs);
+    return callTool(service, { tenant: "demo" }, "search_docs", args, docs);
   }
 
   it("searches with the knowledge base's default limit", async () => {
@@ -247,7 +284,7 @@ describe("search_docs", () => {
   it("does not exist without a knowledge base, even at the dispatch layer", async () => {
     // The server already rejects the name when the catalogue omits it; this is
     // the dispatch refusing to depend on that.
-    const result = await callTool(service, "demo", "search_docs", { query: "x" });
+    const result = await callTool(service, { tenant: "demo" }, "search_docs", { query: "x" });
     assert.equal(result.isError, true);
     assert.match(result.content[0]!.text, /unknown tool "search_docs"/);
   });
@@ -267,7 +304,7 @@ describe("search_docs", () => {
 
 describe("failures", () => {
   it("reports a storage failure as a tool error, not a protocol one", async () => {
-    const result = await callTool(failing, "demo", "recall", { query: "x" });
+    const result = await callTool(failing, { tenant: "demo" }, "recall", { query: "x" });
     assert.equal(result.isError, true);
     assert.match(result.content[0]!.text, /could not complete this request/);
     assert.match(result.content[0]!.text, /S3 is having a day/);
@@ -317,7 +354,7 @@ describe("the log", () => {
     const [refused] = await linesDuring(() => call("recall", { limit: 3 }));
     assert.equal(refused?.ok, false);
     const [failed] = await linesDuring(() =>
-      callTool(failing, "demo", "recall", { query: "x" }),
+      callTool(failing, { tenant: "demo" }, "recall", { query: "x" }),
     );
     assert.equal(failed?.ok, false);
   });

@@ -26,7 +26,12 @@ const BASE_ENV = {
   EMBEDDING_API_KEY: "k",
 } as NodeJS.ProcessEnv;
 
-const calls: { tenant: string; name: string; args: Record<string, unknown> }[] = [];
+const calls: {
+  tenant: string;
+  conversation?: string;
+  name: string;
+  args: Record<string, unknown>;
+}[] = [];
 
 const tools: ToolHandler = {
   definitions: () => [
@@ -36,8 +41,8 @@ const tools: ToolHandler = {
       inputSchema: { type: "object", properties: { q: { type: "string" } } },
     },
   ],
-  call: async (tenant, name, args) => {
-    calls.push({ tenant, name, args });
+  call: async ({ tenant, conversation }, name, args) => {
+    calls.push({ tenant, ...(conversation ? { conversation } : {}), name, args });
     return { content: [{ type: "text", text: `${name} for ${tenant}` }] };
   },
 };
@@ -217,6 +222,35 @@ describe("the tenant", () => {
     const result = await client.callTool({ name: "recall", arguments: {} });
 
     assert.equal(result.isError, true);
+    assert.equal(calls.length, 0, "no tool should have run");
+    await client.close();
+  });
+
+  it("hands the tool the conversation the platform stamped, and none when it stamped none", async () => {
+    const inThread = await connect({ "x-tenant-id": "acme", "x-conversation-id": "slack:C1:1723.45" });
+    calls.length = 0;
+    await inThread.callTool({ name: "recall", arguments: {} });
+    assert.deepEqual(
+      { tenant: calls.at(-1)?.tenant, conversation: calls.at(-1)?.conversation },
+      { tenant: "acme", conversation: "slack:C1:1723.45" },
+    );
+    await inThread.close();
+
+    const bare = await connect({ "x-tenant-id": "acme" });
+    calls.length = 0;
+    await bare.callTool({ name: "recall", arguments: {} });
+    assert.equal(calls.at(-1)?.conversation, undefined);
+    await bare.close();
+  });
+
+  it("refuses a malformed conversation header, naming it, rather than reading it as none", async () => {
+    const client = await connect({ "x-tenant-id": "acme", "x-conversation-id": "not a key" });
+    calls.length = 0;
+
+    const result = await client.callTool({ name: "recall", arguments: {} });
+
+    assert.equal(result.isError, true);
+    assert.match(JSON.stringify(result.content), /x-conversation-id/);
     assert.equal(calls.length, 0, "no tool should have run");
     await client.close();
   });
