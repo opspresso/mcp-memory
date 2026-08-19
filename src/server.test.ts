@@ -6,7 +6,7 @@
  * routing between them — and the tenant, which is this server's own idea and
  * has to reach a tool from the request that carried it.
  *
- * The client is the SDK's, on both eras. AgentDure speaks `2026-07-28` and
+ * The client is the SDK's, on both eras. Agent Studio speaks `2026-07-28` and
  * other callers still open with the `initialize` handshake; the endpoint serves
  * both, and a change that quietly dropped either would look exactly like
  * everything working.
@@ -136,7 +136,7 @@ describe("authentication", () => {
 
 describe("what a client is offered", () => {
   it("serves a client that opens with the 2026-07-28 probe", async () => {
-    // The era AgentDure speaks, and the reason this server moved to the SDK.
+    // The era Agent Studio speaks, and the reason this server moved to the SDK.
     const client = await connect();
 
     assert.equal(client.getProtocolEra(), "modern");

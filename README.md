@@ -91,7 +91,7 @@ guess at when guessing wrong picks another project's memories.
 ### And which conversation is asking
 
 A second header rides beside the tenant when the caller is in a conversation:
-`X-Conversation-Id`, which AgentDure stamps on every MCP request a run makes
+`X-Conversation-Id`, which Agent Studio stamps on every MCP request a run makes
 from a chat (`chat:{id}`), a Slack thread (`slack:{channel}:{thread}`), an
 inbound A2A call (`a2a:{client}:{contextId}`) or an API caller that declared
 one (`api:{caller}:{id}`). Same rules for the same reason: from a header, never
