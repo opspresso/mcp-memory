@@ -19,7 +19,7 @@
 import { createServer, type Server, type ServerResponse } from "node:http";
 import { createMcpHandler } from "@modelcontextprotocol/server";
 import { toNodeHandler } from "@modelcontextprotocol/node";
-import { authorizes } from "./auth.js";
+import { authorizes, authorizesOrigin } from "./auth.js";
 import type { Config } from "./config.js";
 import { logError } from "./log.js";
 import { buildServer, contextOf, type ToolHandler } from "./mcp.js";
@@ -52,18 +52,28 @@ export function createMcpServer(deps: ServerDeps): Server {
 
   return createServer((request, response) => {
     void (async () => {
-      if (request.url === "/health") {
+      const path = (request.url ?? "").split("?", 1)[0] ?? "";
+      if (path === "/health") {
         // Dependency-free on purpose: this answers "is the process serving",
         // and a probe that also checked S3 would restart pods over an outage
         // they cannot fix by restarting.
         send(response, 200, { status: "ok" });
         return;
       }
-      if (!request.url?.startsWith("/mcp")) {
+      if (path !== "/mcp") {
         send(response, 404, { error: "not found" });
         return;
       }
+      if (!authorizesOrigin(request.headers.origin)) {
+        send(response, 403, {
+          jsonrpc: "2.0",
+          id: null,
+          error: { code: -32002, message: "browser origins are not allowed" },
+        });
+        return;
+      }
       if (!authorizes(deps.config.apiKey, request.headers.authorization)) {
+        response.setHeader("www-authenticate", 'Bearer realm="mcp"');
         send(response, 401, {
           jsonrpc: "2.0",
           id: null,

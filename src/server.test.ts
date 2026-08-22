@@ -88,13 +88,21 @@ async function connect(
 
 describe("health", () => {
   it("answers without touching a dependency", async () => {
-    const response = await fetch(`${instance.url}/health`);
+    const response = await fetch(`${instance.url}/health?probe=readiness`);
     assert.equal(response.status, 200);
     assert.deepEqual(await response.json(), { status: "ok" });
   });
 
   it("404s anything that is not the endpoint", async () => {
     assert.equal((await fetch(`${instance.url}/nope`)).status, 404);
+    assert.equal((await fetch(`${instance.url}/mcp-extra`)).status, 404);
+  });
+
+  it("refuses browser origins before protocol dispatch", async () => {
+    const response = await fetch(`${instance.url}/mcp`, {
+      headers: { origin: "https://example.com" },
+    });
+    assert.equal(response.status, 403);
   });
 });
 
@@ -114,6 +122,7 @@ describe("authentication", () => {
         body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "server/discover" }),
       });
       assert.equal(unauthenticated.status, 401);
+      assert.equal(unauthenticated.headers.get("www-authenticate"), 'Bearer realm="mcp"');
       const refusal = (await unauthenticated.json()) as { error?: { code: number } };
       assert.equal(refusal.error?.code, -32001);
 

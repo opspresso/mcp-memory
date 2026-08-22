@@ -77,9 +77,9 @@ can name its own tenant can read another project's memories by asking, including
 a model that was talked into it by text it retrieved a moment earlier. No amount
 of validation fixes that; the channel is wrong.
 
-A request with no tenant is refused rather than defaulted, and `tools/list` is
-refused too — so a missing header shows up the moment someone presses **Test
-connection**, rather than as a working test button and a broken run later.
+The handshake and `tools/list` do not need a tenant: they describe the server,
+not anyone's memories. The tenant is resolved when a tool runs, and a call with
+neither header is refused rather than defaulted.
 
 The value itself is held to at most 128 characters, starting with a letter or a
 digit and otherwise carrying only letters, digits, `.`, `_` and `-`. It lands in
@@ -346,18 +346,18 @@ what admits this one too.
      `X-Tenant-Id: <project name>`, and this server reads it when no
      explicit `X-Memory-Tenant` is configured — each project lands in its own
      tenant with zero per-project setup.
-2. **Test connection fails on the missing tenant, by design.** The probe runs
-   with no project, so it carries no automatic header; the failure proves the
-   server is reachable and refusing an unscoped caller. The same applies to the
-   capability catalog's reindex probe, which indexes this server at server level
-   only.
+2. **Test connection and the capability-catalog probe can list the tools.** They
+   carry no project and therefore no tenant, but discovery is not a memory
+   operation. A tool call without either tenant header is still refused; a bound
+   project run carries the automatic header.
 3. Bind it on the project version that should have a memory.
 
 To *share* one memory across projects — or point one version at a different
 bucket — set `X-Memory-Tenant` explicitly (on the entry, or as a per-version
 header override); an explicit tenant always wins over the automatic project
-name. There is no per-user or per-chat scope — the finest grain the headers
-carry is the project.
+name. There is no per-user scope. Conversation scope is automatic when Agent
+Studio supplies `X-Conversation-Id`; the tenant override changes only which
+project-level memory bucket is used.
 
 ## Run
 
@@ -380,6 +380,9 @@ The protocol is served by `@modelcontextprotocol/server`, which answers **both
 eras from that one endpoint**: a client opening with `server/discover` gets
 revision `2026-07-28`, one opening with the `initialize` handshake is served
 statelessly as before. The server holds nothing between requests either way.
+Requests carrying an `Origin` header are refused with 403: this cluster-internal
+endpoint has no browser caller, and Streamable HTTP requires that boundary
+against DNS rebinding.
 
 The tenant header is this server's own, and it is read when a tool runs rather
 than when a client connects: the handshake says what this server is, which is

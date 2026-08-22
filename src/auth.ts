@@ -20,7 +20,7 @@
 
 import { timingSafeEqual } from "node:crypto";
 
-const BEARER = "Bearer ";
+const BEARER = "bearer";
 
 /** Constant-time compare so a wrong key cannot be found one character at a time. */
 function keyMatches(presented: string, expected: string): boolean {
@@ -38,11 +38,17 @@ export function authorizes(apiKey: string | undefined, authorization: string | u
     return true;
   }
   const header = authorization ?? "";
-  if (!header.startsWith(BEARER)) {
+  const separator = header.indexOf(" ");
+  if (separator < 0 || header.slice(0, separator).toLowerCase() !== BEARER) {
     return false;
   }
-  const token = header.slice(BEARER.length);
+  const token = header.slice(separator).trimStart();
   return token.length > 0 && keyMatches(token, apiKey);
+}
+
+/** Browser-originated requests have no valid caller in this cluster-internal deployment. */
+export function authorizesOrigin(origin: string | undefined): boolean {
+  return origin === undefined;
 }
 
 /** The startup line. Loud in the open mode, because that mode is a bet on the network. */
