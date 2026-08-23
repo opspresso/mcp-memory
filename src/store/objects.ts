@@ -4,19 +4,22 @@
  * A port rather than the SDK directly, for one reason: the counter merging in
  * `stats.ts` is the part of this design that replaces DynamoDB's atomic
  * increments, and it has to be tested against concurrency it can control. That
- * needs an in-memory implementation, which needs an interface.
+ * needs an in-memory implementation, which needs an interface. The same port is
+ * what lets `pgObjects.ts` stand in for S3 on a deployment with no AWS.
  *
  * `put` carries the conditional-write headers because compare-and-swap is what
  * makes the compaction in `stats.ts` safe to run from several pods at once.
+ *
+ * The SDK is loaded lazily — see `vectors.ts` for why.
  */
 
-import {
-  DeleteObjectsCommand,
-  GetObjectCommand,
-  ListObjectsV2Command,
-  PutObjectCommand,
-  S3Client,
-} from "@aws-sdk/client-s3";
+import type { S3Client } from "@aws-sdk/client-s3";
+
+type S3Sdk = typeof import("@aws-sdk/client-s3");
+let sdk: Promise<S3Sdk> | undefined;
+function loadSdk(): Promise<S3Sdk> {
+  return (sdk ??= import("@aws-sdk/client-s3"));
+}
 
 export interface StoredObject {
   body: string;
@@ -53,6 +56,7 @@ export class S3ObjectStore implements ObjectStore {
   ) {}
 
   async get(key: string): Promise<StoredObject | undefined> {
+    const { GetObjectCommand } = await loadSdk();
     try {
       const response = await this.client.send(
         new GetObjectCommand({ Bucket: this.bucket, Key: key }),
@@ -71,6 +75,7 @@ export class S3ObjectStore implements ObjectStore {
   }
 
   async put(key: string, body: string, options: PutOptions = {}): Promise<void> {
+    const { PutObjectCommand } = await loadSdk();
     try {
       await this.client.send(
         new PutObjectCommand({
@@ -94,6 +99,7 @@ export class S3ObjectStore implements ObjectStore {
   }
 
   async list(prefix: string, limit = 1000, startAfter?: string): Promise<string[]> {
+    const { ListObjectsV2Command } = await loadSdk();
     const keys: string[] = [];
     let token: string | undefined;
     do {
@@ -120,6 +126,7 @@ export class S3ObjectStore implements ObjectStore {
     if (keys.length === 0) {
       return;
     }
+    const { DeleteObjectsCommand } = await loadSdk();
     // DeleteObjects takes at most 1000 keys per call.
     for (let i = 0; i < keys.length; i += 1000) {
       const response = await this.client.send(
@@ -145,10 +152,11 @@ export class S3ObjectStore implements ObjectStore {
   }
 }
 
-export function createObjectStore(
+export async function createObjectStore(
   region: string,
   bucket: string,
-): { store: ObjectStore; client: S3Client } {
+): Promise<{ store: ObjectStore; client: S3Client }> {
+  const { S3Client } = await loadSdk();
   const client = new S3Client({ region });
   return { store: new S3ObjectStore(client, bucket), client };
 }

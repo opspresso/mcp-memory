@@ -9,19 +9,16 @@
  * to behave differently for a reason nobody wrote down, so the scoring weights,
  * thresholds and half-lives are constants in `ranking.ts` rather than
  * environment variables. What remains is what a deployment genuinely has to
- * say: where its buckets are, how to embed, and who may call it.
+ * say: where its storage is, how to embed, and who may call it.
  */
 
 export interface Config {
   port: number;
   /** Shared secret callers must present. Unset means no authentication — see `auth.ts`. */
   apiKey: string | undefined;
+  /** The one AWS region: Bedrock, the knowledge base, and the S3 stores when those are in use. */
   region: string;
-  /** S3 Vectors bucket holding the memories themselves. */
-  vectorBucket: string;
-  vectorIndex: string;
-  /** Ordinary S3 bucket holding the access counters and the recency index. */
-  stateBucket: string;
+  storage: StorageConfig;
   /**
    * Bedrock Knowledge Base backing `search_docs`. Unset means memories-only:
    * the tool is not offered at all, and the SDK behind it is never loaded.
@@ -52,11 +49,40 @@ export interface Config {
 }
 
 /**
+ * Where the memories and the counters live.
+ *
+ * Selected by presence rather than by a mode switch: a `DATABASE_URL` names a
+ * PostgreSQL database and is the whole of what that backend needs, so asking
+ * for a second variable to say "and use it" would be one more way for the two
+ * to disagree. Without one the S3 pair is read exactly as it always was.
+ *
+ * The two are not mixed. One backend holds both the vectors and the objects,
+ * because the write order `service.ts` relies on — the vector first, the index
+ * entry after — is a promise about one store's failures, not two.
+ */
+export type StorageConfig =
+  | {
+      backend: "s3";
+      /** S3 Vectors bucket holding the memories themselves. */
+      vectorBucket: string;
+      vectorIndex: string;
+      /** Ordinary S3 bucket holding the access counters and the recency index. */
+      stateBucket: string;
+    }
+  | {
+      backend: "postgres";
+      /** A libpq connection URL. The schema is created on boot — see `store/pg.ts`. */
+      databaseUrl: string;
+    };
+
+/**
  * Where embeddings come from.
  *
  * `dimension` on either must equal the dimension the vector index was created
  * with. S3 Vectors fixes that at creation and will not change it, so a mismatch
- * is not a degraded search — it is every write failing.
+ * is not a degraded search — it is every write failing. PostgreSQL stores a
+ * vector at whatever width it arrived with and refuses to compare two that
+ * differ, so the same mismatch fails every *query* instead.
  */
 export type EmbeddingConfig =
   | { provider: "bedrock"; model: string; dimension: number }
@@ -131,14 +157,35 @@ function loadEmbedding(env: NodeJS.ProcessEnv): EmbeddingConfig {
   throw new ConfigError(`EMBEDDING_PROVIDER must be "bedrock" or "openai", got "${provider}"`);
 }
 
+function loadStorage(env: NodeJS.ProcessEnv): StorageConfig {
+  const databaseUrl = env.DATABASE_URL?.trim();
+  if (databaseUrl) {
+    return { backend: "postgres", databaseUrl };
+  }
+  // Neither named is its own message. Reporting `VECTOR_BUCKET is required`
+  // to someone who meant to configure PostgreSQL sends them to the wrong
+  // documentation; with one bucket named, the S3 path is what was meant and
+  // the missing one is the right thing to say.
+  if (!env.VECTOR_BUCKET?.trim() && !env.STATE_BUCKET?.trim()) {
+    throw new ConfigError(
+      "no storage is configured: set DATABASE_URL for PostgreSQL, " +
+        "or VECTOR_BUCKET and STATE_BUCKET for S3",
+    );
+  }
+  return {
+    backend: "s3",
+    vectorBucket: required(env, "VECTOR_BUCKET"),
+    vectorIndex: env.VECTOR_INDEX?.trim() || "memories",
+    stateBucket: required(env, "STATE_BUCKET"),
+  };
+}
+
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   return {
     port: integer(env, "PORT", 3000),
     apiKey: env.MCP_API_KEY?.trim() || undefined,
     region: env.AWS_REGION?.trim() || "ap-northeast-2",
-    vectorBucket: required(env, "VECTOR_BUCKET"),
-    vectorIndex: env.VECTOR_INDEX?.trim() || "memories",
-    stateBucket: required(env, "STATE_BUCKET"),
+    storage: loadStorage(env),
     knowledgeBaseId: env.KNOWLEDGE_BASE_ID?.trim() || undefined,
     embedding: loadEmbedding(env),
     recallMinSimilarity: ratio(env, "RECALL_MIN_SIMILARITY", 0.1),

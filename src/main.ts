@@ -3,8 +3,9 @@
  * without dropping counters on the floor.
  *
  * Configuration is validated before anything binds a port, so a missing bucket
- * name stops a rollout at the readiness probe rather than surfacing as a tool
- * error inside somebody's agent run.
+ * name — or a database that cannot be reached — stops a rollout at the
+ * readiness probe rather than surfacing as a tool error inside somebody's
+ * agent run.
  */
 
 import { hostname } from "node:os";
@@ -15,9 +16,8 @@ import { KnowledgeBaseRetriever, knowledgeBaseInvoker } from "./docs.js";
 import { BedrockEmbedder, bedrockInvoker, HttpEmbedder, type Embedder } from "./embeddings.js";
 import { createMcpServer } from "./server.js";
 import { S3MemoryService } from "./service.js";
-import { createObjectStore } from "./store/objects.js";
+import { openStores } from "./store/backend.js";
 import { StatsTracker } from "./store/stats.js";
-import { createVectorStore } from "./store/vectors.js";
 import { gracefulShutdown } from "./shutdown.js";
 import { SERVER_NAME, SERVER_VERSION } from "./version.js";
 import { callTool, toolCatalogue } from "./tools.js";
@@ -30,6 +30,21 @@ import { callTool, toolCatalogue } from "./tools.js";
  */
 const SHUTDOWN_GRACE_MS = 10_000;
 
+/**
+ * An error's message, reaching inside an `AggregateError` for it: a refused
+ * connection to `localhost` is one of those — one failure per address the
+ * name resolved to — and its own message is empty.
+ */
+function describeError(error: unknown): string {
+  if (error instanceof AggregateError && error.errors.length > 0) {
+    return error.errors.map(describeError).join("; ");
+  }
+  if (error instanceof Error) {
+    return error.message || (error as { code?: string }).code || error.name;
+  }
+  return String(error);
+}
+
 let config;
 try {
   config = loadConfig();
@@ -41,8 +56,14 @@ try {
   throw error;
 }
 
-const { store: vectors } = createVectorStore(config.region, config.vectorBucket, config.vectorIndex);
-const { store: objects } = createObjectStore(config.region, config.stateBucket);
+// Before the port is bound, like the configuration: a database this process
+// cannot reach, or a schema it may not create, is a failed boot and not a
+// pod that answers the health probe and fails every tool call.
+const stores = await openStores(config.storage, config.region).catch((error: unknown) => {
+  console.error(`storage error: ${describeError(error)}`);
+  return process.exit(1);
+});
+const { vectors, objects } = stores;
 
 const stats = new StatsTracker(objects, {
   // Kubernetes sets HOSTNAME to the pod name. The random suffix distinguishes
@@ -89,9 +110,8 @@ const server = createMcpServer({
 server.listen(config.port, () => {
   console.log(`${SERVER_NAME} v${SERVER_VERSION} listening on :${config.port} (POST /mcp)`);
   console.log(
-    `store: s3vectors://${config.vectorBucket}/${config.vectorIndex} ` +
-      `(${config.embedding.provider}:${config.embedding.model}, ${config.embedding.dimension}d), ` +
-      `state: s3://${config.stateBucket}`,
+    `${stores.description} ` +
+      `(${config.embedding.provider}:${config.embedding.model}, ${config.embedding.dimension}d)`,
   );
   console.log(
     config.knowledgeBaseId
@@ -113,7 +133,15 @@ server.listen(config.port, () => {
 // flushing at all. See `shutdown.ts`.
 const leave = gracefulShutdown(server, stats, {
   graceMs: SHUTDOWN_GRACE_MS,
-  exit: (code) => process.exit(code),
+  // The pool is drained after the flush that needed it, and never stands
+  // between the process and its exit: a connection that will not close is not
+  // worth the grace period.
+  exit: (code) => {
+    void stores
+      .close()
+      .catch(() => {})
+      .finally(() => process.exit(code));
+  },
 });
 for (const signal of ["SIGTERM", "SIGINT"] as const) {
   process.on(signal, leave);
