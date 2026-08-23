@@ -23,6 +23,22 @@ jobs:
   verify:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # The PostgreSQL backend's tests run only where TEST_DATABASE_URL names a
+    # database with pgvector, and skip — visibly — everywhere else. This is
+    # the one place they must not skip.
+    services:
+      postgres:
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_USER: memory
+          POSTGRES_PASSWORD: memory
+          POSTGRES_DB: mcp_memory_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U memory -d mcp_memory_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
@@ -32,6 +48,8 @@ jobs:
       - run: npm ci
       - run: npm run typecheck
       - run: npm test
+        env:
+          TEST_DATABASE_URL: postgres://memory:memory@localhost:5432/mcp_memory_test
 
       # The image is what ships, and it has broken on its own in a sibling
       # repository before — a build stage once lacked a tsconfig the build

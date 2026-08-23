@@ -11,21 +11,28 @@
  * second lookup: `QueryVectors` returns the text alongside the distance. The
  * budget for that is fixed and small — see `assertWithinMetadataBudget`.
  *
- * A port with two implementations. S3 Vectors has no local emulator, so the
- * fake is the only way the layers above it get tested at all; it is in
- * `src/testing/` rather than beside a test file because the service tests need
- * it too.
+ * A port with three implementations: this one, `pgVectors.ts` over pgvector,
+ * and the fake in `src/testing/`. S3 Vectors has no local emulator, so the
+ * fake is the only way the layers above it get tested without a database; it
+ * is there rather than beside a test file because the service tests need it
+ * too. The port, the metadata shape and the budget live here because the other
+ * two implement the same record — `fromMetadata` is what makes a memory read
+ * back the same whichever store holds it.
+ *
+ * The SDK is loaded lazily, as `embeddings.ts` and `docs.ts` load theirs: a
+ * PostgreSQL deployment imports this module for the port and must not pay for
+ * an AWS client it will never construct.
  */
 
-import {
-  DeleteVectorsCommand,
-  GetVectorsCommand,
-  PutVectorsCommand,
-  QueryVectorsCommand,
-  S3VectorsClient,
-} from "@aws-sdk/client-s3vectors";
+import type { S3VectorsClient } from "@aws-sdk/client-s3vectors";
 import type { StoredMemory } from "../types.js";
 import { isMemoryScope, isMemoryType } from "../types.js";
+
+type S3VectorsSdk = typeof import("@aws-sdk/client-s3vectors");
+let sdk: Promise<S3VectorsSdk> | undefined;
+function loadSdk(): Promise<S3VectorsSdk> {
+  return (sdk ??= import("@aws-sdk/client-s3vectors"));
+}
 
 /**
  * Total metadata per vector is capped at 40 KB by the service. This is the
@@ -228,6 +235,7 @@ export class S3VectorsStore implements VectorStore {
 
   async put(memory: StoredMemory, embedding: number[]): Promise<void> {
     assertWithinMetadataBudget(memory);
+    const { PutVectorsCommand } = await loadSdk();
     await this.client.send(
       new PutVectorsCommand({
         vectorBucketName: this.bucket,
@@ -244,6 +252,7 @@ export class S3VectorsStore implements VectorStore {
   }
 
   async query(tenantId: string, embedding: number[], topK: number): Promise<VectorHit[]> {
+    const { QueryVectorsCommand } = await loadSdk();
     const response = await this.client.send(
       new QueryVectorsCommand({
         vectorBucketName: this.bucket,
@@ -278,6 +287,7 @@ export class S3VectorsStore implements VectorStore {
       return [];
     }
     const found: StoredMemory[] = [];
+    const { GetVectorsCommand } = await loadSdk();
     // GetVectors takes at most 100 keys per call.
     for (let i = 0; i < ids.length; i += 100) {
       const response = await this.client.send(
@@ -302,6 +312,7 @@ export class S3VectorsStore implements VectorStore {
     if (ids.length === 0) {
       return;
     }
+    const { DeleteVectorsCommand } = await loadSdk();
     // DeleteVectors takes at most 500 keys per call.
     for (let i = 0; i < ids.length; i += 500) {
       await this.client.send(
@@ -315,11 +326,12 @@ export class S3VectorsStore implements VectorStore {
   }
 }
 
-export function createVectorStore(
+export async function createVectorStore(
   region: string,
   bucket: string,
   index: string,
-): { store: VectorStore; client: S3VectorsClient } {
+): Promise<{ store: VectorStore; client: S3VectorsClient }> {
+  const { S3VectorsClient } = await loadSdk();
   const client = new S3VectorsClient({ region });
   return { store: new S3VectorsStore(client, bucket, index), client };
 }

@@ -15,9 +15,12 @@ It exists because every run starts from nothing. An agent that decided something
 last week, or was told a convention, or worked out which command actually works,
 has no way to know it now — so the user explains it again, or the agent guesses.
 
-## Storage is S3, and only S3
+## Storage is S3 — or PostgreSQL
 
-Two buckets, no database.
+Two buckets and no database, or one database and no AWS. The S3 pair is the
+original and is described here; the [PostgreSQL backend](#postgresql) below
+stands in for both buckets behind the same two interfaces, and everything
+above them — ranking, dedup, tenancy, the counters — is the same code.
 
 **S3 Vectors** holds the memories. The body rides in the vector's own metadata,
 so `recall` is one `QueryVectors` call — the text comes back with the distance,
@@ -65,6 +68,72 @@ s3://<STATE_BUCKET>/
   stats/<tenant>/shard/<ulid>-<podId>.json      one pod-flush of counter deltas
   stats/<tenant>/merged.json                    folded counters + watermark
 ```
+
+### PostgreSQL
+
+Set `DATABASE_URL` and nothing else about storage: the buckets are not
+required, the AWS SDKs are never loaded, and the process needs no credentials
+beyond the URL. It is the backend for a deployment with no AWS at all — an
+on-premises Agent Studio — and it is selected by presence, so a `DATABASE_URL`
+beside a pair of buckets means PostgreSQL.
+
+```
+DATABASE_URL=postgres://memory:…@postgres:5432/memory
+EMBEDDING_PROVIDER=openai EMBEDDING_BASE_URL=… EMBEDDING_API_KEY=…
+```
+
+The second line is not optional in practice. Bedrock is still the default
+embedder, and a deployment that chose PostgreSQL to avoid AWS will want an
+OpenAI-compatible endpoint for the same reason — an in-house model server, or
+a provider. `search_docs` stays a Bedrock Knowledge Base and stays optional;
+without `KNOWLEDGE_BASE_ID` it is not offered, as before.
+
+The schema is the process's own. The first pod to start creates what is
+missing — under an advisory lock, so several starting together do not race
+each other on the same `CREATE` — and a later boot finds it there:
+
+```sql
+CREATE EXTENSION IF NOT EXISTS vector;
+
+CREATE TABLE memories (            -- one row per memory; what S3 Vectors held
+  tenant_id text NOT NULL,
+  id        text NOT NULL,
+  embedding vector NOT NULL,       -- no width: it is the embedding model's
+  metadata  jsonb NOT NULL,        -- exactly the metadata the S3 store writes
+  PRIMARY KEY (tenant_id, id)
+);
+
+CREATE SEQUENCE objects_version;
+CREATE TABLE objects (             -- one row per key; what ordinary S3 held
+  key        text COLLATE "C" PRIMARY KEY,
+  body       text NOT NULL,
+  version    bigint NOT NULL,      -- the ETag: a compare-and-swap names it
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+```
+
+Three things in it are deliberate. **The vector column has no width**, so the
+dimension is whatever `EMBEDDING_DIM` says and a model swap needs no migration
+— though the memories already written are at the old width, and pgvector
+refuses to compare two widths, so a swap still means re-embedding or starting
+a fresh database. **There is no vector index.** A recall is an exact scan over
+one tenant's rows, ordered by cosine distance (`<=>`), and similarity is
+`1 − distance` — the same number S3 Vectors reports, so `RECALL_MIN_SIMILARITY`
+means the same under either backend. An approximate index can miss the
+nearest neighbour, which is precisely the one dedup asks for, and a project
+holds thousands of memories rather than millions. **The key column is
+collated `"C"`**: the recency index sorts newest-first only in byte order,
+which is what S3 lists in and what a locale collation does not.
+
+`CREATE EXTENSION vector` needs a superuser unless the build marks pgvector
+trusted. If the role the server runs as cannot create it, the boot says so and
+names the statement to run; the `pgvector/pgvector` image ships the extension,
+and creating it once by hand is all that is needed.
+
+Nothing else changes. Counters are still per-pod shards folded in with a
+compare-and-swap — PostgreSQL could count atomically, but the design that
+needs no lock is the one tested, and it runs unchanged on a row version. The
+S3 path is exactly what it was: same code, same buckets, same index.
 
 ## Which memories a caller gets
 
@@ -144,11 +213,13 @@ Worth knowing before you rely on it:
   only once a minute, so another pod's flush reaches this one's ranking that
   much later — its own reads are counted immediately either way. They feed
   ranking and nothing else.
-- **No automatic expiry.** S3 Vectors has no lifecycle rules, so nothing ages
-  out on its own. `forget` is the only removal.
+- **No automatic expiry.** S3 Vectors has no lifecycle rules, and nothing is
+  scheduled against the PostgreSQL tables either, so nothing ages out on its
+  own. `forget` is the only removal.
 - **No keyword matching.** A query naming something the embedding does not
   associate — a library name, an error code — will not find it by that name
-  alone. Catching those needs a full-text index, which S3 has no equivalent for.
+  alone. Catching those needs a full-text index, which S3 has no equivalent for
+  and which the PostgreSQL backend does not build.
 - **No knowledge graph, contradiction detection, or consolidation.** A memory
   that contradicts an older one simply outranks it as the older one decays;
   nothing detects the conflict or reconciles the two.
@@ -157,9 +228,10 @@ Worth knowing before you rely on it:
 
 | Variable | Default | |
 |---|---|---|
-| `VECTOR_BUCKET` | — | **required.** S3 Vectors bucket holding the memories |
+| `DATABASE_URL` | unset | a PostgreSQL connection URL. **Set, it selects the [PostgreSQL backend](#postgresql)** and the three S3 variables below are not read |
+| `VECTOR_BUCKET` | — | **required without `DATABASE_URL`.** S3 Vectors bucket holding the memories |
 | `VECTOR_INDEX` | `memories` | index within it |
-| `STATE_BUCKET` | — | **required.** Ordinary S3 bucket for counters and the recency index |
+| `STATE_BUCKET` | — | **required without `DATABASE_URL`.** Ordinary S3 bucket for counters and the recency index |
 | `KNOWLEDGE_BASE_ID` | unset | Bedrock Knowledge Base behind `search_docs`; unset, the tool is not offered at all |
 | `EMBEDDING_PROVIDER` | `bedrock` | `bedrock` or `openai` |
 | `EMBEDDING_MODEL` | `amazon.titan-embed-text-v2:0` | `text-embedding-3-small` under `openai` |
@@ -173,8 +245,10 @@ Worth knowing before you rely on it:
 | `STATS_FLUSH_MS` | `30000` | how often a pod pushes its counters |
 | `STATS_COMPACT_THRESHOLD` | `20` | a reader folds shards in once more than this many are *older than the lag* |
 
-All of it is validated before the port is bound, so a missing bucket name stops
-a rollout at the probe rather than surfacing inside somebody's agent run.
+All of it is validated before the port is bound, so a missing bucket name — or
+neither backend configured, which is refused by name — stops a rollout at the
+probe rather than surfacing inside somebody's agent run. So does a database the
+process cannot reach: the schema is created before the port is bound.
 
 Bedrock is the default because it needs no API key — the pod's own role covers
 it, so there is no secret to mount or rotate — and it runs in the same region as
@@ -284,7 +358,8 @@ caller may talk to the server; the header says whose memories they get.
 
 ## Creating the vector index
 
-Do this before the first deploy. **Dimension, distance metric and the
+S3 only — PostgreSQL creates its own schema at boot. Do this before the first
+deploy. **Dimension, distance metric and the
 non-filterable metadata keys cannot be changed after creation** — changing any of
 them means a new index and re-embedding everything, so they belong in IaC rather
 than in a console session.
@@ -373,6 +448,17 @@ Bedrock:
     EMBEDDING_PROVIDER=openai EMBEDDING_BASE_URL=… EMBEDDING_API_KEY=… \
       VECTOR_BUCKET=… STATE_BUCKET=… node dist/main.js
 
+PostgreSQL instead of both buckets, with no AWS anywhere — the container is
+the same image:
+
+    docker run --rm -p 3000:3000 \
+      -e DATABASE_URL=postgres://memory:secret@postgres:5432/memory \
+      -e EMBEDDING_PROVIDER=openai \
+      -e EMBEDDING_BASE_URL=http://llm.internal:8000/v1 \
+      -e EMBEDDING_API_KEY=… \
+      -e EMBEDDING_MODEL=text-embedding-3-small -e EMBEDDING_DIM=1536 \
+      ghcr.io/opspresso/mcp-memory:latest
+
     POST /mcp      JSON-RPC; Authorization: Bearer <MCP_API_KEY> when a key is set
     GET  /health   liveness
 
@@ -390,7 +476,8 @@ true whoever is asking, so a client that connects lazily is not told about a
 header problem before it has asked for anything. A call without the header comes
 back as a tool error naming the header to set.
 
-AWS credentials come from the pod's role. Never bake keys into the image.
+AWS credentials, where the deployment uses AWS, come from the pod's role. Never
+bake keys into the image.
 
 The process logs one JSON line per event. Every tool call leaves a `tool_call`
 line on stdout — the tool, the tenant, how long it took and whether it answered
@@ -414,6 +501,18 @@ npm test
 ```
 
 `typecheck` + `test` are the checks; `build` is the third.
+
+The PostgreSQL backend is tested against a real database when one is named,
+and skipped — visibly, with the reason — when none is. CI names one
+(`pgvector/pgvector:pg17` as a service); locally:
+
+```bash
+docker run -d -p 5432:5432 -e POSTGRES_USER=memory -e POSTGRES_PASSWORD=memory \
+  -e POSTGRES_DB=mcp_memory_test pgvector/pgvector:pg17
+TEST_DATABASE_URL=postgres://memory:memory@localhost:5432/mcp_memory_test npm test
+```
+
+The tests empty both tables before each case, so the database is theirs alone.
 
 S3 Vectors has no local emulator, so `src/testing/fakes.ts` stands in for both
 stores and for the embedder. Its similarity scale is harsher than a real model's

@@ -12,12 +12,39 @@ import { ConfigError, loadConfig } from "./config.js";
 const MINIMAL = { VECTOR_BUCKET: "vectors", STATE_BUCKET: "state" } as NodeJS.ProcessEnv;
 
 describe("loadConfig", () => {
-  it("needs both buckets named", () => {
-    assert.throws(() => loadConfig({} as NodeJS.ProcessEnv), ConfigError);
+  it("needs both buckets named once one is", () => {
     assert.throws(
       () => loadConfig({ VECTOR_BUCKET: "vectors" } as NodeJS.ProcessEnv),
       /STATE_BUCKET is required/,
     );
+    assert.throws(
+      () => loadConfig({ STATE_BUCKET: "state" } as NodeJS.ProcessEnv),
+      /VECTOR_BUCKET is required/,
+    );
+    assert.deepEqual(loadConfig(MINIMAL).storage, {
+      backend: "s3",
+      vectorBucket: "vectors",
+      vectorIndex: "memories",
+      stateBucket: "state",
+    });
+  });
+
+  it("names both backends when neither is configured", () => {
+    // `VECTOR_BUCKET is required` sends an on-premises operator to the S3
+    // documentation for a deployment that was never going to have a bucket.
+    assert.throws(() => loadConfig({} as NodeJS.ProcessEnv), /DATABASE_URL.*VECTOR_BUCKET/);
+  });
+
+  it("takes a DATABASE_URL as the whole of the PostgreSQL configuration", () => {
+    const config = loadConfig({ DATABASE_URL: " postgres://u:p@db/memory " } as NodeJS.ProcessEnv);
+    assert.deepEqual(config.storage, { backend: "postgres", databaseUrl: "postgres://u:p@db/memory" });
+  });
+
+  it("lets the database URL win when buckets are named beside it", () => {
+    // Presence selects. The buckets are simply not read, so a compose file
+    // that still carries them does not have to be edited to move.
+    const config = loadConfig({ ...MINIMAL, DATABASE_URL: "postgres://db/memory" });
+    assert.equal(config.storage.backend, "postgres");
   });
 
   it("defaults to Bedrock, which needs no key", () => {
