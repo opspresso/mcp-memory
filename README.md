@@ -8,7 +8,7 @@ An MCP server that gives an Agent Studio project a memory that outlives a run.
 | `remember(content, type?, category?, tags?, scope?)` | a fact worth keeping — for the project, or with `scope: "conversation"` for this conversation alone | the id it was stored under, or the existing one that already said it |
 | `list_memories(type?, limit?)` | — | this project's memories, newest first |
 | `forget(id)` | an id from `recall` | confirmation, or that no such memory exists |
-| `memory_stats()` | — | how many memories there are, by type; a lower bound past 10,000 |
+| `memory_stats()` | — | how many memories this conversation can see, by type; a lower bound past 10,000 |
 | `search_docs(query, limit?)` | a question in natural language | matching documentation excerpts with their sources — offered only when `KNOWLEDGE_BASE_ID` is set |
 
 It exists because every run starts from nothing. An agent that decided something
@@ -176,11 +176,12 @@ What it changes:
   no conversation is refused by name, never silently filed under the project.
 - **A project memory written from a conversation records which one**, as
   provenance. Its visibility is not narrowed.
-- **`recall` and `list_memories` answer with the project's memories plus this
-  conversation's own.** Another conversation's scoped notes never reach the
-  model — not in the results, not in the "gated out" count, and not as the
-  "already known" answer to a `remember`. The store's own filter stays the one
-  tenant key it has always been; visibility is applied on the way out.
+- **`recall`, `list_memories` and `memory_stats` answer with the project's
+  memories plus this conversation's own.** Another conversation's scoped notes
+  never reach the model — not in the results, not in the "gated out" count, not
+  in the totals, and not as the "already known" answer to a `remember`. The
+  store's own filter stays the one tenant key it has always been; visibility is
+  applied on the way out.
 
 The header is optional. A request without one — a probe, a **Test connection**,
 a webhook firing, an API call that declared no conversation — reads and writes
@@ -328,7 +329,9 @@ overshoots is told which field to shorten instead of getting a size back from
 AWS that names neither the field nor the limit.
 
 `memory_stats` has a ceiling of its own: it counts index keys and stops at
-10,000, past which it reports a lower bound and says so. `search_docs` has one
+10,000, past which it reports a lower bound and says so. The cap is on keys
+scanned rather than on memories counted, so a caller whose totals were thinned
+by another thread's notes is told the same thing. `search_docs` has one
 on the way out rather than in: an excerpt is cut at 2,000 characters, with a
 note saying so and pointing at the source. How large a chunk is belongs to the
 knowledge base's ingestion and not to this server, and a generously-chunked

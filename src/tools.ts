@@ -165,8 +165,10 @@ export const TOOLS: readonly ToolDefinition[] = [
   {
     name: "memory_stats",
     description:
-      "How many memories this project has, broken down by type. Exact up to " +
-      `${STATS_SCAN_CAP} memories; past that the answer says so and reports a lower bound.`,
+      "How many memories this project has, broken down by type. Counts the same memories " +
+      "recall and list_memories can show you — the project's, plus this conversation's own — " +
+      `and never another conversation's. Exact up to ${STATS_SCAN_CAP} memories; past that ` +
+      "the answer says so and reports a lower bound.",
     inputSchema: { type: "object", properties: {} },
   },
 ];
@@ -395,7 +397,7 @@ async function dispatch(
       case "forget":
         return text(await service.forget(tenant, requireString(args, "id")));
       case "memory_stats":
-        return text(await service.stats(tenant));
+        return text(await service.stats(tenant, { conversation }));
       case "search_docs": {
         // Without a knowledge base the tool is absent from the catalogue and
         // the server rejects the name before it gets here — but the dispatch

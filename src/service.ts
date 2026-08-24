@@ -91,6 +91,11 @@ export interface ListRequest {
   conversation?: string;
 }
 
+export interface StatsRequest {
+  /** See {@link RecallRequest.conversation}. Counted the same way it is recalled and listed. */
+  conversation?: string;
+}
+
 /**
  * The visibility rule, in one place: a project memory is everyone's, a
  * conversation memory is its own conversation's and nobody else's — a request
@@ -109,7 +114,7 @@ export interface MemoryService {
   remember(tenant: string, request: RememberRequest): Promise<string>;
   list(tenant: string, request: ListRequest): Promise<string>;
   forget(tenant: string, id: string): Promise<string>;
-  stats(tenant: string): Promise<string>;
+  stats(tenant: string, request: StatsRequest): Promise<string>;
 }
 
 /**
@@ -467,7 +472,7 @@ export class S3MemoryService implements MemoryService {
       );
 
     return [
-      `[MEMORY] ${ordered.length} memories, newest first.`,
+      `[MEMORY] ${ordered.length} ${ordered.length === 1 ? "memory" : "memories"}, newest first.`,
       "",
       ...ordered.map((memory, i) => render(memory, i + 1)),
     ].join("\n");
@@ -542,12 +547,17 @@ export class S3MemoryService implements MemoryService {
     return `[MEMORY] Deleted ${id}.`;
   }
 
-  async stats(tenant: string): Promise<string> {
+  async stats(tenant: string, request: StatsRequest = {}): Promise<string> {
     const keys = await this.objects.list(`index/${tenant}/`, STATS_SCAN_CAP);
     const counts = new Map<string, number>();
     for (const key of keys) {
       const entry = parseIndexKey(key);
-      if (entry) {
+      // Counted the way it would be recalled and listed. A total that included
+      // other threads' notes would contradict the two tools that can actually
+      // show them: a model told there are forty memories, offered twenty-two
+      // by `list_memories` and given no way to reconcile the difference, has
+      // been handed a number about memories it may not see.
+      if (entry && entryVisibleTo(entry, request.conversation)) {
         counts.set(entry.memoryType, (counts.get(entry.memoryType) ?? 0) + 1);
       }
     }
@@ -558,12 +568,16 @@ export class S3MemoryService implements MemoryService {
     const breakdown = MEMORY_TYPES.filter((type) => counts.has(type))
       .map((type) => `${type}: ${counts.get(type)}`)
       .join(", ");
+    // Against the keys scanned, not the memories counted: what the cap
+    // truncated is the listing, and a filtered-down total is a lower bound
+    // just the same.
+    const noun = total === 1 ? "memory" : "memories";
     if (keys.length >= STATS_SCAN_CAP) {
       return (
-        `[MEMORY] At least ${total} memories for this project (${breakdown}). ` +
+        `[MEMORY] At least ${total} ${noun} for this project (${breakdown}). ` +
         `Counting stopped at ${STATS_SCAN_CAP} keys, so every figure here is a lower bound.`
       );
     }
-    return `[MEMORY] ${total} memories for this project (${breakdown}).`;
+    return `[MEMORY] ${total} ${noun} for this project (${breakdown}).`;
   }
 }

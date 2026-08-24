@@ -99,7 +99,22 @@ describe("conversation scope", () => {
     const bare = await service.list("alpha", { limit: 20 });
     assert.match(bare, /Everyone's fact/);
     assert.doesNotMatch(bare, /Note for thread/);
-    assert.match(bare, /1 memories/);
+    assert.match(bare, /1 memory, newest first/, "and counts what it actually shows");
+  });
+
+  it("counts a thread its own notes and the project's, never another thread's", async () => {
+    // The same rule `recall` and `list_memories` answer by. A total that
+    // included another thread's notes is a number about memories the caller
+    // has no way to see, and cannot be reconciled with the listing beside it.
+    await remember("Note for thread one", { scope: "conversation", conversation: THREAD });
+    clock += 1000;
+    await remember("Note for thread two", { scope: "conversation", conversation: OTHER });
+    clock += 1000;
+    await remember("Everyone's fact", {});
+
+    assert.match(await service.stats("alpha", { conversation: THREAD }), /2 memories/);
+    assert.match(await service.stats("alpha", { conversation: OTHER }), /2 memories/);
+    assert.match(await service.stats("alpha", {}), /1 memory for this project/);
   });
 
   it("fills a listing past another thread's notes rather than returning fewer than asked", async () => {
