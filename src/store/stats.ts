@@ -291,7 +291,7 @@ export class StatsTracker {
       }
     }
 
-    this.remember(tenant, counts);
+    this.cacheCounts(tenant, counts);
 
     // Only shards old enough that nothing can still land beneath them are
     // absorbed — see `COMPACTION_LAG_MS`. The younger ones are counted above
@@ -335,7 +335,7 @@ export class StatsTracker {
    * the way in, which is bounded by the number of tenants and only happens on a
    * cache miss.
    */
-  private remember(tenant: string, counts: Delta): void {
+  private cacheCounts(tenant: string, counts: Delta): void {
     const at = this.now();
     for (const [key, entry] of this.cache) {
       if (at - entry.at >= this.cacheTtlMs) {

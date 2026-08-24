@@ -568,10 +568,10 @@ export class S3MemoryService implements MemoryService {
     const breakdown = MEMORY_TYPES.filter((type) => counts.has(type))
       .map((type) => `${type}: ${counts.get(type)}`)
       .join(", ");
-    // Against the keys scanned, not the memories counted: what the cap
-    // truncated is the listing, and a filtered-down total is a lower bound
-    // just the same.
     const noun = total === 1 ? "memory" : "memories";
+    // Against the keys scanned, not the memories counted: what the cap
+    // truncated is the listing, and a total thinned by another thread's notes
+    // is a lower bound just the same.
     if (keys.length >= STATS_SCAN_CAP) {
       return (
         `[MEMORY] At least ${total} ${noun} for this project (${breakdown}). ` +
