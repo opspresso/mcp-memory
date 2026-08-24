@@ -26,7 +26,7 @@ import {
   type MemoryScope,
   type MemoryType,
 } from "./types.js";
-import { MAX_CONTENT_BYTES } from "./store/vectors.js";
+import { MAX_CONTENT_BYTES, VectorStoreError } from "./store/vectors.js";
 import { STATS_SCAN_CAP, type MemoryService } from "./service.js";
 
 export interface ToolDefinition {
@@ -426,9 +426,19 @@ async function dispatch(
         return failure(`Error: unknown tool "${name}".`);
     }
   } catch (error) {
-    if (error instanceof ArgumentError) {
-      // The model's mistake, and it can see the message. Nothing for an
-      // operator to act on, so nothing goes to the log.
+    // Both are the model's mistake, and it can see the message, so nothing
+    // goes to the log — there is nothing for an operator to act on.
+    //
+    // `VectorStoreError` is one of these despite arriving from the store: it
+    // is the metadata budget refusing what the *model* sent, and the checks
+    // above cannot catch all of it. Content and category are bounded on their
+    // own; what they cannot see is the sum — twenty tags beside a 32 KB body
+    // against a 40 KB ceiling, a category beside a long conversation id
+    // against the filterable half's 2 KB. Reported as a dependency failure it
+    // woke somebody for a sentence only the model could act on, and buried
+    // the actionable half in "the memory store could not complete this
+    // request".
+    if (error instanceof ArgumentError || error instanceof VectorStoreError) {
       return failure(`Error: ${error.message}`);
     }
     // Everything else is a dependency failing. The model gets a sentence and

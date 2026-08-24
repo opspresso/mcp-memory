@@ -14,6 +14,8 @@
  * write, and it should say so in terms that name the cause.
  */
 
+import type { BedrockRuntimeClient } from "@aws-sdk/client-bedrock-runtime";
+
 export interface Embedder {
   embed(text: string): Promise<number[]>;
 }
@@ -154,13 +156,20 @@ export class BedrockEmbedder implements Embedder {
 
 /** The real Bedrock call, kept apart so the embedder itself needs no AWS client to test. */
 export function bedrockInvoker(region: string): BedrockEmbeddingOptions["invoke"] {
-  // Imported lazily so a deployment using the HTTP provider never loads the SDK.
-  const client = import("@aws-sdk/client-bedrock-runtime").then(
-    ({ BedrockRuntimeClient }) => new BedrockRuntimeClient({ region }),
-  );
+  // Imported lazily so a deployment using the HTTP provider never loads the
+  // SDK — and started on the first call rather than here. A promise built at
+  // wiring time is one nobody is awaiting yet, so an import that fails becomes
+  // an unhandled rejection: the process is already past `listen`, so the pod
+  // has answered its readiness probe and then dies with a stack pointing at
+  // nothing anybody wrote. Reached through the call instead, the same failure
+  // arrives where it can be said in a sentence.
+  let client: Promise<BedrockRuntimeClient> | undefined;
   return async (body, model) => {
     const { InvokeModelCommand } = await import("@aws-sdk/client-bedrock-runtime");
-    const response = await (await client).send(
+    const bedrock = await (client ??= import("@aws-sdk/client-bedrock-runtime").then(
+      ({ BedrockRuntimeClient }) => new BedrockRuntimeClient({ region }),
+    ));
+    const response = await bedrock.send(
       new InvokeModelCommand({ modelId: model, body, contentType: "application/json" }),
     );
     return JSON.parse(new TextDecoder().decode(response.body));

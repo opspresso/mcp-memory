@@ -18,6 +18,7 @@ import {
   type StoredObject,
 } from "../store/objects.js";
 import {
+  assertWithinMetadataBudget,
   fromMetadata,
   toMetadata,
   vectorKey,
@@ -79,6 +80,10 @@ export class InMemoryVectorStore implements VectorStore {
   private readonly records = new Map<string, { metadata: Record<string, unknown>; embedding: number[] }>();
 
   async put(memory: StoredMemory, embedding: number[]): Promise<void> {
+    // Both real stores refuse an over-budget memory here, so the layers above
+    // must meet it here too — otherwise a service test stores what neither
+    // would have taken.
+    assertWithinMetadataBudget(memory);
     const metadata = toMetadata(memory);
     // The service refuses these, and refuses the whole write rather than the
     // one field. Enforced here too because the first version of this fake did

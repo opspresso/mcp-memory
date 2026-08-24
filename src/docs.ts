@@ -10,6 +10,8 @@
  * documentation is for everyone. See the README's tenancy note.
  */
 
+import type { BedrockAgentRuntimeClient } from "@aws-sdk/client-bedrock-agent-runtime";
+
 /** One excerpt the knowledge base returned. */
 export interface RetrievedDoc {
   excerpt: string;
@@ -129,13 +131,18 @@ export function renderDocs(query: string, docs: RetrievedDoc[]): string {
 
 /** The real Retrieve call, kept apart so the retriever itself needs no AWS client to test. */
 export function knowledgeBaseInvoker(region: string): KnowledgeBaseOptions["invoke"] {
-  // Imported lazily so a memories-only deployment never loads the SDK.
-  const client = import("@aws-sdk/client-bedrock-agent-runtime").then(
-    ({ BedrockAgentRuntimeClient }) => new BedrockAgentRuntimeClient({ region }),
-  );
+  // Imported lazily so a memories-only deployment never loads the SDK — and
+  // started on the first call rather than here. See `bedrockInvoker`: a promise
+  // built at wiring time is one nobody is awaiting yet, so an import that fails
+  // takes the process down after it has already answered its readiness probe,
+  // with a stack pointing at nothing anybody wrote.
+  let client: Promise<BedrockAgentRuntimeClient> | undefined;
   return async (knowledgeBaseId, query, limit) => {
     const { RetrieveCommand } = await import("@aws-sdk/client-bedrock-agent-runtime");
-    return (await client).send(
+    const agent = await (client ??= import("@aws-sdk/client-bedrock-agent-runtime").then(
+      ({ BedrockAgentRuntimeClient }) => new BedrockAgentRuntimeClient({ region }),
+    ));
+    return agent.send(
       new RetrieveCommand({
         knowledgeBaseId,
         retrievalQuery: { text: query },

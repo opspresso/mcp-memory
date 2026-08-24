@@ -11,7 +11,7 @@ import assert from "node:assert/strict";
 import { describe, it, mock } from "node:test";
 import type { DocsRetriever } from "./docs.js";
 import type { MemoryService } from "./service.js";
-import { MAX_CONTENT_BYTES } from "./store/vectors.js";
+import { MAX_CONTENT_BYTES, VectorStoreError } from "./store/vectors.js";
 import { callTool, MAX_QUERY_CHARS, MAX_TAGS, SEARCH_DOCS_TOOL, TOOLS, toolCatalogue } from "./tools.js";
 
 const seen: unknown[] = [];
@@ -41,6 +41,20 @@ const failing: MemoryService = {
     throw new Error("S3 is having a day");
   },
   remember: async () => "",
+  list: async () => "",
+  forget: async () => "",
+  stats: async () => "",
+};
+
+/** A store refusing the metadata budget — what the model sent, not a dependency failing. */
+const overBudget: MemoryService = {
+  recall: async () => "",
+  remember: async () => {
+    throw new VectorStoreError(
+      "the memory and its labels are 41000 bytes against a 40000 byte limit. " +
+        "Shorten the tags, or store a shorter fact.",
+    );
+  },
   list: async () => "",
   forget: async () => "",
   stats: async () => "",
@@ -312,6 +326,23 @@ describe("failures", () => {
 
   it("rejects a tool it does not have", async () => {
     assert.equal((await call("drop_everything", {})).isError, true);
+  });
+
+  it("hands a budget refusal back as the model's mistake, not a dependency failing", async () => {
+    // The store is the only place that can see the *sum* — twenty tags beside
+    // a 32 KB body — so the refusal arrives from it. It is still something
+    // only the model can act on: reported as a storage failure it woke
+    // somebody, and buried the actionable sentence behind one that was wrong.
+    const wrote = mock.method(console, "error", () => {});
+    try {
+      const result = await callTool(overBudget, { tenant: "demo" }, "remember", { content: "x" });
+      assert.equal(result.isError, true);
+      assert.match(result.content[0]!.text, /Shorten the tags/);
+      assert.doesNotMatch(result.content[0]!.text, /could not complete this request/);
+      assert.equal(wrote.mock.callCount(), 0, "nothing for an operator to act on");
+    } finally {
+      wrote.mock.restore();
+    }
   });
 });
 
