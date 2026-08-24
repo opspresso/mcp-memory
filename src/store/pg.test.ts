@@ -246,7 +246,10 @@ describe("PostgreSQL backend", { skip }, () => {
 
       const id = /\[id:([0-9A-Z]{26})\]/.exec(stored)![1]!;
       assert.match(await service.forget("acme", id), /Deleted/);
-      assert.match(await service.stats("acme"), /1 memories/);
+      // Names which one survived, not just how many: the forget above took the
+      // project memory, so a count that still said "1" would pass while having
+      // deleted the wrong row.
+      assert.match(await service.stats("acme"), /1 memory for this project \(pattern: 1\)/);
       assert.match(await service.list("other", { limit: 20 }), /no memories/);
     });
   });
