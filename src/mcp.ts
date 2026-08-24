@@ -64,12 +64,25 @@ const validator = new AjvJsonSchemaValidator();
  * it makes, and `x-memory-tenant` is what an operator can set on a registry
  * entry when they want one project's memories under a name of their own.
  *
+ * The refusal names the header the value actually arrived on. Told
+ * `x-memory-tenant is too long` by a platform that only ever sends
+ * `x-tenant-id`, an operator goes looking for a header nobody set — and finds
+ * nothing, because the bad value is on the other one. With neither sent there
+ * is no such header, and the message stays the one that says where to put it.
+ *
+ * A blank explicit header is no choice at all, so it gives way to the generic
+ * one rather than masking it: a registry that stamps an override it has no
+ * value for must not turn a working request into a refusal.
+ *
  * @throws {TenantError} which the caller turns into a refusal naming the header.
  */
 export function tenantOf(request: Request | undefined): string {
-  return parseTenant(
-    request?.headers.get(TENANT_HEADER) ?? request?.headers.get(TENANT_ID_HEADER) ?? undefined,
-  );
+  const explicit = request?.headers.get(TENANT_HEADER)?.trim();
+  if (explicit) {
+    return parseTenant(explicit, TENANT_HEADER);
+  }
+  const generic = request?.headers.get(TENANT_ID_HEADER)?.trim();
+  return generic ? parseTenant(generic, TENANT_ID_HEADER) : parseTenant(undefined);
 }
 
 /**

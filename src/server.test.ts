@@ -235,6 +235,33 @@ describe("the tenant", () => {
     await client.close();
   });
 
+  it("names the header the bad value actually came on", async () => {
+    // Told to fix `x-memory-tenant` by a platform that only ever sends
+    // `x-tenant-id`, an operator goes looking for a header nobody set.
+    const client = await connect({ "x-tenant-id": "not a slug!" });
+    calls.length = 0;
+
+    const result = await client.callTool({ name: "recall", arguments: {} });
+
+    assert.equal(result.isError, true);
+    assert.match(JSON.stringify(result.content), /x-tenant-id/);
+    assert.doesNotMatch(JSON.stringify(result.content), /x-memory-tenant/);
+    assert.equal(calls.length, 0, "no tool should have run");
+    await client.close();
+  });
+
+  it("does not let a blank explicit header mask the one the platform stamped", async () => {
+    // A registry entry that stamps an override it has no value for is a
+    // configuration accident, not a choice of tenant.
+    const client = await connect({ "x-memory-tenant": "  ", "x-tenant-id": "project-a" });
+    calls.length = 0;
+
+    await client.callTool({ name: "recall", arguments: {} });
+
+    assert.equal(calls.at(-1)?.tenant, "project-a");
+    await client.close();
+  });
+
   it("hands the tool the conversation the platform stamped, and none when it stamped none", async () => {
     const inThread = await connect({ "x-tenant-id": "acme", "x-conversation-id": "slack:C1:1723.45" });
     calls.length = 0;

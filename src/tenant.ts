@@ -47,33 +47,41 @@ export class TenantError extends Error {}
 /**
  * Validate a tenant identifier.
  *
+ * `header` names the header the value arrived on, because two of them may
+ * carry it and the refusal has to say which one to go and fix. It defaults to
+ * {@link TENANT_HEADER}: with nothing sent at all there is no such header, and
+ * the one an operator sets by hand is the one to name.
+ *
  * @throws TenantError when absent or malformed — the caller turns this into a
  * protocol error, so a misconfigured binding fails loudly on its first call.
  */
-export function parseTenant(raw: string | string[] | undefined): string {
+export function parseTenant(
+  raw: string | string[] | undefined,
+  header: string = TENANT_HEADER,
+): string {
   // A repeated header is ambiguous about which value was meant, and guessing is
   // how the wrong tenant gets picked. Node hands duplicates back as an array.
   if (Array.isArray(raw)) {
-    throw new TenantError(`${TENANT_HEADER} was sent more than once`);
+    throw new TenantError(`${header} was sent more than once`);
   }
   const value = raw?.trim();
   if (!value) {
     throw new TenantError(
-      `${TENANT_HEADER} header is required — set it on the MCP server entry in the registry`,
+      `${header} header is required — set it on the MCP server entry in the registry`,
     );
   }
   if (value.length > MAX_LENGTH) {
-    throw new TenantError(`${TENANT_HEADER} is too long (max ${MAX_LENGTH} characters)`);
+    throw new TenantError(`${header} is too long (max ${MAX_LENGTH} characters)`);
   }
   if (!ALLOWED.test(value)) {
     throw new TenantError(
-      `${TENANT_HEADER} must start with a letter or digit and contain only letters, digits, '.', '_' or '-'`,
+      `${header} must start with a letter or digit and contain only letters, digits, '.', '_' or '-'`,
     );
   }
   // `.` and `..` pass the pattern and mean something to a path. Nothing else
   // does: the pattern already bars '/', so no other traversal spelling exists.
   if (value === "." || value === "..") {
-    throw new TenantError(`${TENANT_HEADER} is not a valid tenant`);
+    throw new TenantError(`${header} is not a valid tenant`);
   }
   return value;
 }

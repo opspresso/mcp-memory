@@ -148,7 +148,10 @@ of validation fixes that; the channel is wrong.
 
 The handshake and `tools/list` do not need a tenant: they describe the server,
 not anyone's memories. The tenant is resolved when a tool runs, and a call with
-neither header is refused rather than defaulted.
+neither header is refused rather than defaulted. A refusal names the header the
+value actually came on, and a blank explicit header gives way to the stamped one
+rather than masking it — a registry entry that carries an override it has no
+value for is an accident, not a choice of tenant.
 
 The value itself is held to at most 128 characters, starting with a letter or a
 digit and otherwise carrying only letters, digits, `.`, `_` and `-`. It lands in
