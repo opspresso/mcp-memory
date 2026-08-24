@@ -224,6 +224,13 @@ Worth knowing before you rely on it:
   associate — a library name, an error code — will not find it by that name
   alone. Catching those needs a full-text index, which S3 has no equivalent for
   and which the PostgreSQL backend does not build.
+- **A busy thread can crowd a recall.** The store is asked for the nearest
+  hundred within the tenant and visibility is applied to what comes back, so a
+  conversation whose own notes fill that neighbourhood leaves fewer places for
+  the project's memories — and a project memory that would have ranked
+  hundred-and-first is not reached at all. Narrowing the store's own filter
+  instead would make the tenant key on that line a compound one, and that line
+  is the isolation boundary.
 - **No knowledge graph, contradiction detection, or consolidation.** A memory
   that contradicts an older one simply outranks it as the older one decays;
   nothing detects the conflict or reconciles the two.
