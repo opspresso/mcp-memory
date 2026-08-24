@@ -541,16 +541,16 @@ to the GitOps repository, which is what puts it on alpha.
 
 ```bash
 npm version 0.4.3 --no-git-tag-version
-git add package.json package-lock.json src/server.ts
+git add package.json package-lock.json src/version.ts
 git commit -m "chore: release v0.4.3"
 git tag v0.4.3
 git push origin main v0.4.3
 ```
 
 The version is written in three places — `package.json`, its lock file, and
-`SERVER_VERSION` in `src/server.ts`, which is what a client is told it connected
+`SERVER_VERSION` in `src/version.ts`, which is what a client is told it connected
 to. `npm version` moves all three, the third through `scripts/sync-version.mjs`
-on npm's `version` hook, and the check in `src/server.test.ts` fails the build if
+on npm's `version` hook, and the check in `src/version.test.ts` fails the build if
 they ever part company. `--no-git-tag-version` leaves the commit and the tag to
 the lines below it, so the history reads `chore: release …` rather than npm's
 bare version.
