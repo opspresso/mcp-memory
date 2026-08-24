@@ -187,6 +187,22 @@ describe("remember", () => {
     assert.equal(vectors.size, 2);
   });
 
+  it("finds the nearest neighbour rather than taking whichever came back first", async () => {
+    // `VectorStore.query` promises the nearest neighbours and no order at all,
+    // and dedup is the one caller whose wrong pick is silent: it compares
+    // against a hit that is not the closest, sees nothing near enough, and
+    // writes a second copy of a fact already stored. Several unrelated
+    // memories first, so the duplicate is not the only thing to find.
+    await remember("Readiness probes point at slash health on port three thousand");
+    await remember("Nightly backups land in the archive bucket every Sunday");
+    await remember("The deploy pipeline pushes to ECR then dispatches to ArgoCD");
+
+    const again = await remember("The deploy pipeline pushes to ECR then dispatches to ArgoCD");
+
+    assert.match(again, /Already known/);
+    assert.equal(vectors.size, 3, "a near-duplicate must not accumulate");
+  });
+
   it("writes the recency index only after the memory itself", async () => {
     // Order matters: an index entry with no memory behind it shows up in a
     // listing as something that cannot be read.

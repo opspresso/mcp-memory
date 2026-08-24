@@ -17,12 +17,13 @@
  */
 
 import assert from "node:assert/strict";
-import { after, before, beforeEach, describe, it } from "node:test";
+import { EventEmitter } from "node:events";
+import { after, before, beforeEach, describe, it, mock } from "node:test";
 import pg from "pg";
 import { S3MemoryService } from "../service.js";
 import { FakeEmbedder } from "../testing/fakes.js";
 import { PreconditionFailed } from "./objects.js";
-import { ensureSchema } from "./pg.js";
+import { ensureSchema, reportIdleFailures } from "./pg.js";
 import { PgObjectStore } from "./pgObjects.js";
 import { PgVectorStore } from "./pgVectors.js";
 import { StatsTracker } from "./stats.js";
@@ -248,5 +249,31 @@ describe("PostgreSQL backend", { skip }, () => {
       assert.match(await service.stats("acme"), /1 memories/);
       assert.match(await service.list("other", { limit: 20 }), /no memories/);
     });
+  });
+});
+
+/**
+ * No database needed: the failure is Node's, not PostgreSQL's. An EventEmitter
+ * throws an `error` it has no listener for, and a pool emits one when a
+ * connection sitting idle in it dies — so the whole property is that the emit
+ * comes back rather than ending the process.
+ */
+describe("an idle connection dying", () => {
+  it("is reported instead of taking the process down", () => {
+    const pool = new EventEmitter();
+    const wrote = mock.method(console, "error", () => {});
+    reportIdleFailures(pool);
+    try {
+      assert.doesNotThrow(() => pool.emit("error", new Error("connection terminated unexpectedly")));
+      assert.equal(wrote.mock.callCount(), 1);
+      assert.match(String(wrote.mock.calls[0]?.arguments[0]), /pg_idle_client_failed/);
+    } finally {
+      wrote.mock.restore();
+    }
+  });
+
+  it("would end it without the listener, which is why the listener is there", () => {
+    const pool = new EventEmitter();
+    assert.throws(() => pool.emit("error", new Error("connection terminated unexpectedly")));
   });
 });

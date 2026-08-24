@@ -103,7 +103,14 @@ export class InMemoryVectorStore implements VectorStore {
       // the distance it returns.
       hits.push({ memory, similarity: dot(embedding, record.embedding) });
     }
-    return hits.sort((a, b) => b.similarity - a.similarity).slice(0, topK);
+    // Sorted to pick the nearest `topK`, then handed back worst-first. The port
+    // promises the nearest neighbours and no order at all, and a fake that
+    // quietly returned them best-first let a caller take `[0]` and be right by
+    // accident — on a store that does not sort, it would not be.
+    return hits
+      .sort((a, b) => b.similarity - a.similarity)
+      .slice(0, topK)
+      .reverse();
   }
 
   async get(tenantId: string, ids: string[]): Promise<StoredMemory[]> {

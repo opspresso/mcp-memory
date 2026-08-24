@@ -30,7 +30,7 @@ import {
 } from "./ranking.js";
 import type { ObjectStore } from "./store/objects.js";
 import { StatsTracker } from "./store/stats.js";
-import type { VectorStore } from "./store/vectors.js";
+import type { VectorHit, VectorStore } from "./store/vectors.js";
 import type { MemoryScope, MemoryType, RankedMemory, RecallMode, StoredMemory } from "./types.js";
 import { MEMORY_TYPES } from "./types.js";
 
@@ -209,6 +209,24 @@ function day(iso: string): string {
 }
 
 /**
+ * The closest of a set of hits, or `undefined` when there are none.
+ *
+ * `VectorStore.query` returns the nearest neighbours in no promised order, so
+ * every caller that needs the best one has to find it. `recall` does the same
+ * thing with `Math.max` over the similarities; this is the version that has to
+ * carry the hit itself.
+ */
+function nearestOf(hits: readonly VectorHit[]): VectorHit | undefined {
+  let best: VectorHit | undefined;
+  for (const hit of hits) {
+    if (!best || hit.similarity > best.similarity) {
+      best = hit;
+    }
+  }
+  return best;
+}
+
+/**
  * One memory as the model sees it.
  *
  * `standing` is a fraction of the top result's score, never a cosine. What a
@@ -372,8 +390,16 @@ export class S3MemoryService implements MemoryService {
     // "already known" must never point at a memory the caller cannot see. A
     // handful of neighbours rather than one, since the closest may be someone
     // else's.
-    const [nearest] = (await this.vectors.query(tenant, embedding, 5)).filter((hit) =>
-      visibleTo(hit.memory, request.conversation),
+    //
+    // Found rather than taken: `VectorStore.query` promises the nearest
+    // neighbours and says nothing about the order they arrive in, and this is
+    // the one place a wrong pick is silent — dedup compares against whichever
+    // hit came first, so under a store that does not sort, a near-verbatim
+    // repeat lands beside its twin instead of merging.
+    const nearest = nearestOf(
+      (await this.vectors.query(tenant, embedding, 5)).filter((hit) =>
+        visibleTo(hit.memory, request.conversation),
+      ),
     );
     if (
       nearest &&

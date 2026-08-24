@@ -15,6 +15,7 @@
  */
 
 import pg from "pg";
+import { logError } from "../log.js";
 import { PgObjectStore } from "./pgObjects.js";
 import { PgVectorStore } from "./pgVectors.js";
 import type { ObjectStore } from "./objects.js";
@@ -110,8 +111,31 @@ export interface PgStores {
   close(): Promise<void>;
 }
 
+/**
+ * Say when an idle connection dies, rather than letting it end the process.
+ *
+ * A pool emits `error` for a connection sitting *idle* in it — the database
+ * restarting, a proxy reaping the connection, a network blip — and an
+ * EventEmitter with no listener for `error` **throws what it was handed**. So
+ * the pod that had done nothing wrong exits, on the exact day the database is
+ * already having trouble, over a connection nobody was using.
+ *
+ * There is nothing to do about it beyond saying so: the pool has already
+ * discarded that client, and the next `connect` opens a fresh one. Its own
+ * exported function so the listener can be proved to be there — the property
+ * that matters is not what it logs but that the emit does not throw.
+ */
+export function reportIdleFailures(pool: {
+  on(event: "error", listener: (error: Error) => void): unknown;
+}): void {
+  pool.on("error", (error) => {
+    logError("pg_idle_client_failed", error);
+  });
+}
+
 export async function openPgStores(databaseUrl: string): Promise<PgStores> {
   const pool = new pg.Pool({ connectionString: databaseUrl });
+  reportIdleFailures(pool);
   try {
     await ensureSchema(pool);
   } catch (error) {
