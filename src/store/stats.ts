@@ -243,6 +243,14 @@ export class StatsTracker {
     return all.get(id) ?? EMPTY_STATS;
   }
 
+  /**
+   * How many tenants' counters are held. Only a test asks — what eviction
+   * changes is memory, and memory is not otherwise observable from outside.
+   */
+  get cachedTenants(): number {
+    return this.cache.size;
+  }
+
   /** Resolves once any in-flight compaction has settled. */
   async settled(): Promise<void> {
     await this.compaction;
@@ -283,7 +291,7 @@ export class StatsTracker {
       }
     }
 
-    this.cache.set(tenant, { counts, at: this.now() });
+    this.remember(tenant, counts);
 
     // Only shards old enough that nothing can still land beneath them are
     // absorbed — see `COMPACTION_LAG_MS`. The younger ones are counted above
@@ -316,6 +324,25 @@ export class StatsTracker {
         });
     }
     return counts;
+  }
+
+  /**
+   * Hold a tenant's merged counters, and let go of the ones nothing is reading.
+   *
+   * Entries expired on a timestamp but nothing ever removed them, so a pod that
+   * had served a thousand tenants held a thousand tenants' counters — every
+   * memory any of them had ever touched — for the rest of its life. Swept on
+   * the way in, which is bounded by the number of tenants and only happens on a
+   * cache miss.
+   */
+  private remember(tenant: string, counts: Delta): void {
+    const at = this.now();
+    for (const [key, entry] of this.cache) {
+      if (at - entry.at >= this.cacheTtlMs) {
+        this.cache.delete(key);
+      }
+    }
+    this.cache.set(tenant, { counts, at });
   }
 
   private async readMerged(tenant: string): Promise<{ value: Merged; etag: string | undefined }> {
@@ -372,6 +399,20 @@ export class StatsTracker {
       this.pending.delete(tenant);
       const key = `${shardPrefix(tenant)}${ulid(this.now())}-${this.options.podId}.json`;
       await this.store.put(key, JSON.stringify(deltas));
+      // A cached read predates the shard just written, and the pending counts
+      // that stood in for it have gone — so without this, a memory this pod
+      // had counted reads as *untouched* from here until the cache expires,
+      // sinking in the ranking it was climbing. Exactly the regression the
+      // pending half exists to prevent, reintroduced by the flush.
+      //
+      // Folded in rather than invalidated: the shard is durable now, so a
+      // re-read would spend a round trip to be told what this pod just wrote.
+      // Double counting cannot follow — a miss replaces the entry wholesale
+      // with merged plus the shards, this one included.
+      const cached = this.cache.get(tenant);
+      if (cached) {
+        addInto(cached.counts, deltas);
+      }
     }
   }
 

@@ -280,6 +280,46 @@ describe("StatsTracker", () => {
     assert.equal((await reader.load(TENANT)).get("m1")?.accessCount, 2, "cache expired");
   });
 
+  it("does not lose its own counts to the flush that made them durable", async () => {
+    // The pending counts stand in for a shard that has not been written yet.
+    // Writing it clears them, and a cached read from before it knows nothing
+    // about it — so between the two, a memory this pod had counted would read
+    // as never used at all.
+    const store = new InMemoryObjectStore();
+    let clock = START;
+    const pod = tracker(store, "pod-a", { cacheTtlMs: 60_000, now: () => clock });
+
+    pod.record(TENANT, "m1");
+    assert.equal((await pod.load(TENANT)).get("m1")?.accessCount, 1, "counted before the flush");
+
+    clock += 1000;
+    await pod.flush();
+
+    assert.equal((await pod.load(TENANT)).get("m1")?.accessCount, 1, "and still counted after it");
+
+    // And not counted twice once the cache goes back to the store for itself.
+    clock += 60_000;
+    assert.equal((await pod.load(TENANT)).get("m1")?.accessCount, 1, "nor twice on the re-read");
+  });
+
+  it("lets go of a tenant nothing has read for longer than the TTL", async () => {
+    // The entries expired on a timestamp and were never removed, so a pod
+    // accumulated every tenant it had ever served — and every counter each of
+    // them held — until it was restarted.
+    const store = new InMemoryObjectStore();
+    let clock = START;
+    const reader = tracker(store, "reader", { cacheTtlMs: 60_000, now: () => clock });
+
+    for (const tenant of ["alpha", "beta", "gamma"]) {
+      await reader.load(tenant);
+    }
+    assert.equal(reader.cachedTenants, 3);
+
+    clock += 60_000;
+    await reader.load("delta");
+    assert.equal(reader.cachedTenants, 1, "the three that expired are gone, not merely stale");
+  });
+
   it("drops a counter whose timestamp will not parse", async () => {
     // `lastAt` is fed to `Date.parse` on the recall path, and a NaN from there
     // does not sink one memory — it scrambles the ranking of every memory in
