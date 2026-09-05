@@ -13,4 +13,4 @@
  */
 
 export const SERVER_NAME = "mcp-memory";
-export const SERVER_VERSION = "0.8.2";
+export const SERVER_VERSION = "0.9.0";
