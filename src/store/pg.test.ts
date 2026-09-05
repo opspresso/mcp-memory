@@ -93,7 +93,8 @@ describe("PostgreSQL memory store", { skip }, () => {
     assert.equal((await memories.list("acme", { limit: 10 })).length, 1);
     assert.equal((await memories.list("acme", { limit: 10, conversation: "chat:1" })).length, 2);
     assert.equal((await memories.query("acme", [1, 0, 0], 10, "chat:2")).length, 2);
-    assert.deepEqual(await memories.count("acme", "chat:1"), { project: 1, conversation: 1 });
+    assert.deepEqual(await memories.count("acme"), { project: 1 });
+    assert.deepEqual(await memories.count("acme", "chat:1"), { project: 2 });
   });
 
   it("accepts whatever width the embedding model produces", async () => {
