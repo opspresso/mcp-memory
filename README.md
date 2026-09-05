@@ -2,7 +2,7 @@
 
 Agent Studio의 실행이 끝난 뒤에도 프로젝트 결정과 대화 메모리를 보존하는 MCP 서버다.
 메모리 저장과 의미 기반 검색만 담당하며 RAG 문서, chunk, Knowledge Graph는
-[`agent-memory`](../agent-memory)가 담당한다.
+[`agent-memory`](https://github.com/opspresso/agent-memory)가 담당한다.
 
 ## 기능
 
@@ -110,7 +110,7 @@ DATABASE_URL=postgres://mcp_memory:secret@postgres:5432/mcp_memory npm start
 
 ## IDC 배포
 
-[`dockpad`](../dockpad)의 IDC 배포처럼 Agent Studio가 소유한 PostgreSQL 18/pgvector와
+[`dockpad`](https://github.com/opspresso/dockpad)의 IDC 배포처럼 Agent Studio가 소유한 PostgreSQL 18/pgvector와
 `agent-studio_default` network를 공유한다. 배포 절차는 다음 계약을 지킨다.
 
 1. 배포 스크립트가 공유 PostgreSQL에 `mcp_memory` database를 만든다.
@@ -159,3 +159,21 @@ conversation scope 메모리는 같은 tenant와 conversation에만 보인다. �
 
 메모리 본문은 최대 32,000 bytes, category는 128 bytes, tag는 최대 20개이며 각 64 bytes다.
 로그에는 query, 본문, tag, conversation id, embedding을 기록하지 않는다.
+
+## Release
+
+release는 `v*` tag가 시작한다. workflow가 typecheck, PostgreSQL integration을 포함한 전체
+test, container build를 검증한 뒤 GitHub Release와 ECR/GHCR image를 만들고 alpha GitOps
+배포를 요청한다.
+
+breaking change는 minor version을 올린다. version은 `package.json`, `package-lock.json`,
+`src/version.ts`에서 일치해야 한다.
+
+```bash
+RELEASE_VERSION=0.9.0
+npm version "$RELEASE_VERSION" --no-git-tag-version
+git add package.json package-lock.json src/version.ts
+git commit -m "chore: release v$RELEASE_VERSION"
+git tag "v$RELEASE_VERSION"
+git push origin main "v$RELEASE_VERSION"
+```

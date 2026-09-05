@@ -23,6 +23,19 @@ env:
 jobs:
   verify:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:0.8.6-pg18-trixie
+        env:
+          POSTGRES_USER: memory
+          POSTGRES_PASSWORD: memory
+          POSTGRES_DB: mcp_memory_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U memory -d mcp_memory_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
@@ -31,6 +44,8 @@ jobs:
       - run: npm ci
       - run: npm run typecheck
       - run: npm test
+        env:
+          TEST_DATABASE_URL: postgres://memory:memory@localhost:5432/mcp_memory_test
 
   # Notes come from the commit subjects between this tag and the previous one, so
   # the release page says what changed without anyone writing it twice. Scoped
