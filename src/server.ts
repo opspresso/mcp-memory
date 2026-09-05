@@ -54,9 +54,8 @@ export function createMcpServer(deps: ServerDeps): Server {
     void (async () => {
       const path = (request.url ?? "").split("?", 1)[0] ?? "";
       if (path === "/health") {
-        // Dependency-free on purpose: this answers "is the process serving",
-        // and a probe that also checked S3 would restart pods over an outage
-        // they cannot fix by restarting.
+        // Dependency-free on purpose: this answers "is the process serving".
+        // Storage readiness is established by opening PostgreSQL before listen.
         send(response, 200, { status: "ok" });
         return;
       }

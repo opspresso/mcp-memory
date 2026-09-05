@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { ConversationError, conversationKeyPart, parseConversation } from "./conversation.js";
+import { ConversationError, parseConversation } from "./conversation.js";
 
 describe("parseConversation", () => {
   it("is absent when the header is, or is blank — a request need not be in a conversation", () => {
@@ -24,14 +24,5 @@ describe("parseConversation", () => {
     assert.throws(() => parseConversation("회의"), ConversationError);
     assert.throws(() => parseConversation("line\nbreak"), ConversationError);
     assert.throws(() => parseConversation(["one", "two"]), ConversationError);
-  });
-});
-
-describe("conversationKeyPart", () => {
-  it("is stable, fixed-width, and free of the characters an index key splits on", () => {
-    const part = conversationKeyPart("slack:C1/x#y%25");
-    assert.equal(part, conversationKeyPart("slack:C1/x#y%25"));
-    assert.match(part, /^[0-9a-f]{16}$/);
-    assert.notEqual(part, conversationKeyPart("slack:C1/x#y%26"));
   });
 });

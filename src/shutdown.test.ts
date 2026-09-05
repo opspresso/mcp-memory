@@ -1,13 +1,7 @@
-/**
- * The property under test is the one that only shows up on a bad day: the
- * counters get flushed whether or not the server manages to close.
- */
-
 import assert from "node:assert/strict";
 import { afterEach, describe, it } from "node:test";
-import { gracefulShutdown, type Closable, type Flushable } from "./shutdown.js";
+import { gracefulShutdown, type Closable } from "./shutdown.js";
 
-/** A server that closes when told to, or never — the two cases that matter. */
 function serverThat(closes: boolean): Closable & { closeRequested: boolean } {
   return {
     closeRequested: false,
@@ -20,82 +14,55 @@ function serverThat(closes: boolean): Closable & { closeRequested: boolean } {
   };
 }
 
-function counters(): Flushable & { flushes: number } {
-  return {
-    flushes: 0,
-    async stop() {
-      this.flushes += 1;
-    },
-  };
-}
-
-/**
- * A deadline timer that holds the event loop open.
- *
- * Production unrefs its timer so a shutdown in progress can never be the reason
- * the process lingers. A test needs the opposite: with nothing else pending,
- * an unref'd deadline lets Node exit before it fires, and the test is cancelled
- * rather than failed — which is how this passed locally, where other test files
- * kept the loop busy, and died in CI.
- */
 const pending: NodeJS.Timeout[] = [];
 const holdingTimer = (handler: () => void, ms: number) => {
   pending.push(setTimeout(handler, ms));
-  return {}; // no `unref`, so `gracefulShutdown`'s optional call is a no-op
+  return {};
 };
 
-// Released afterwards, or a test that never reaches its deadline would hold the
-// suite open for the whole of it.
 afterEach(() => {
   for (const timer of pending.splice(0)) {
     clearTimeout(timer);
   }
 });
 
-/** Resolves with the exit code the handler eventually calls. */
-function leaving(server: Closable, stats: Flushable, graceMs: number): Promise<number> {
+function leaving(server: Closable, graceMs: number): Promise<number> {
   return new Promise((resolve) => {
-    gracefulShutdown(server, stats, { graceMs, exit: resolve, setTimer: holdingTimer })();
+    gracefulShutdown(server, { graceMs, exit: resolve, setTimer: holdingTimer })();
   });
 }
 
 describe("gracefulShutdown", () => {
-  it("closes the server before flushing, then exits", async () => {
+  it("closes the server and exits", async () => {
     const server = serverThat(true);
-    const stats = counters();
-
-    assert.equal(await leaving(server, stats, 10_000), 0);
-    assert.equal(server.closeRequested, true, "the server must stop taking work first");
-    assert.equal(stats.flushes, 1);
-  });
-
-  it("flushes anyway when close never comes back", async () => {
-    // The failure this exists for: one request wedged against a slow S3 holds
-    // `close` open, the flush never runs, and SIGKILL at the end of the grace
-    // period takes the counters it was protecting.
-    const server = serverThat(false);
-    const stats = counters();
-
-    assert.equal(await leaving(server, stats, 20), 0);
+    assert.equal(await leaving(server, 10_000), 0);
     assert.equal(server.closeRequested, true);
-    assert.equal(stats.flushes, 1, "counters must survive a server that will not close");
   });
 
-  it("flushes once when close and the deadline both land", async () => {
-    const server = serverThat(true);
-    const stats = counters();
-
-    await leaving(server, stats, 5);
-    await new Promise((resolve) => setTimeout(resolve, 25));
-    assert.equal(stats.flushes, 1, "the deadline must not flush on top of a clean close");
+  it("exits at the deadline when close never comes back", async () => {
+    const server = serverThat(false);
+    assert.equal(await leaving(server, 20), 0);
+    assert.equal(server.closeRequested, true);
   });
 
-  it("ignores a second signal from an impatient rollout", async () => {
+  it("exits once when close and the deadline both land", async () => {
     const server = serverThat(true);
-    const stats = counters();
     let exits = 0;
+    gracefulShutdown(server, {
+      graceMs: 5,
+      exit: () => {
+        exits += 1;
+      },
+      setTimer: holdingTimer,
+    })();
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    assert.equal(exits, 1);
+  });
 
-    const leave = gracefulShutdown(server, stats, {
+  it("ignores a second signal", async () => {
+    const server = serverThat(true);
+    let exits = 0;
+    const leave = gracefulShutdown(server, {
       graceMs: 10_000,
       exit: () => {
         exits += 1;
@@ -105,15 +72,6 @@ describe("gracefulShutdown", () => {
     leave();
     leave();
     await new Promise((resolve) => setTimeout(resolve, 10));
-
-    assert.equal(stats.flushes, 1);
-    assert.equal(exits, 1, "a second SIGTERM must not exit out from under the first");
-  });
-
-  it("exits even when the final flush fails", async () => {
-    // An exit conditional on the flush succeeding would hang on exactly the
-    // outage that makes it fail.
-    const failing: Flushable = { stop: () => Promise.reject(new Error("S3 is down")) };
-    assert.equal(await leaving(serverThat(true), failing, 10_000), 0);
+    assert.equal(exits, 1);
   });
 });

@@ -2,11 +2,8 @@
  * The domain, such as it is: a memory, and the things that rank one above
  * another.
  *
- * Split deliberately into what S3 Vectors holds and what ordinary S3 holds.
- * A `StoredMemory` is immutable — it is written once and never updated, because
- * updating it means rewriting a vector. Everything that changes as a memory is
- * used lives in `MemoryStats`, which is accumulated per pod and merged on read.
- * Keeping the two apart is what lets this run on S3 with no locking at all.
+ * A `StoredMemory` is immutable after insertion. PostgreSQL updates only its
+ * access statistics as a memory is recalled.
  */
 
 export const MEMORY_TYPES = ["project", "pattern", "reference", "conversation"] as const;
@@ -35,7 +32,15 @@ export function isMemoryScope(value: unknown): value is MemoryScope {
   return typeof value === "string" && (MEMORY_SCOPES as readonly string[]).includes(value);
 }
 
-/** The immutable half: what `PutVectors` wrote, and what `QueryVectors` gives back. */
+/** The visibility rule shared by recall, dedup, listing and statistics. */
+export function visibleTo(
+  memory: Pick<StoredMemory, "scope" | "conversation">,
+  conversation: string | undefined,
+): boolean {
+  return memory.scope !== "conversation" || (!!conversation && memory.conversation === conversation);
+}
+
+/** The immutable fields stored beside the pgvector embedding. */
 export interface StoredMemory {
   id: string;
   tenantId: string;
@@ -62,19 +67,12 @@ export interface StoredMemory {
   trustBase: number;
 }
 
-/** The mutable half: counters, merged from per-pod shards at read time. */
+/** The mutable access fields PostgreSQL increments atomically. */
 export interface MemoryStats {
   accessCount: number;
-  /** ISO 8601. Merged as a max, so the newest observation across pods wins. */
+  /** ISO 8601 timestamp of the newest observation. */
   lastAccessedAt: string;
 }
-
-/**
- * Shared, and frozen for that reason. `StatsTracker.statsFor` hands this same
- * object back for every memory nobody has touched, so one caller mutating it
- * would rewrite what all the others read.
- */
-export const EMPTY_STATS: MemoryStats = Object.freeze({ accessCount: 0, lastAccessedAt: "" });
 
 /** A memory as `recall` ranks and returns it. */
 export interface RankedMemory extends StoredMemory {

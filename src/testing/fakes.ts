@@ -1,72 +1,17 @@
 /**
- * In-memory stand-ins for the three things this server cannot run locally.
- *
- * S3 Vectors has no emulator and no local mode, and neither does S3's
- * conditional-write behaviour in any form worth trusting. Without these the
- * layers above the stores would go untested entirely, so the fakes are held to
- * the parts of the contract the code actually leans on — conditional writes
- * that fail the way S3 fails them, listings that come back ascending, and a
- * similarity that responds to what the text says.
+ * In-memory adapters for deterministic application tests.
  */
 
 import { createHash } from "node:crypto";
 import type { Embedder } from "../embeddings.js";
 import {
-  PreconditionFailed,
-  type ObjectStore,
-  type PutOptions,
-  type StoredObject,
-} from "../store/objects.js";
-import {
-  assertWithinMetadataBudget,
-  fromMetadata,
-  toMetadata,
-  vectorKey,
-  VectorStoreError,
-  type VectorHit,
-  type VectorStore,
-} from "../store/vectors.js";
-import type { StoredMemory } from "../types.js";
-
-export class InMemoryObjectStore implements ObjectStore {
-  private readonly objects = new Map<string, StoredObject>();
-  private version = 0;
-  /** Every key ever written, in order — lets a test assert what was called. */
-  readonly writes: string[] = [];
-
-  async get(key: string): Promise<StoredObject | undefined> {
-    return this.objects.get(key);
-  }
-
-  async put(key: string, body: string, options: PutOptions = {}): Promise<void> {
-    const existing = this.objects.get(key);
-    if (options.ifNoneMatch && existing) {
-      throw new PreconditionFailed(`object already exists at ${key}`);
-    }
-    if (options.ifMatch !== undefined && existing?.etag !== options.ifMatch) {
-      throw new PreconditionFailed(`etag mismatch at ${key}`);
-    }
-    this.objects.set(key, { body, etag: `"v${++this.version}"` });
-    this.writes.push(key);
-  }
-
-  async list(prefix: string, limit = 1000, startAfter?: string): Promise<string[]> {
-    return [...this.objects.keys()]
-      .filter((key) => key.startsWith(prefix) && (!startAfter || key > startAfter))
-      .sort()
-      .slice(0, limit);
-  }
-
-  async delete(keys: string[]): Promise<void> {
-    for (const key of keys) {
-      this.objects.delete(key);
-    }
-  }
-
-  get size(): number {
-    return this.objects.size;
-  }
-}
+  assertWithinContentBudget,
+  type ListMemoriesOptions,
+  type MemoryCounts,
+  type MemoryHit,
+  type MemoryStore,
+} from "../store/memoryStore.js";
+import { isMemoryType, visibleTo, type MemoryStats, type StoredMemory } from "../types.js";
 
 function dot(a: number[], b: number[]): number {
   let sum = 0;
@@ -76,37 +21,43 @@ function dot(a: number[], b: number[]): number {
   return sum;
 }
 
-export class InMemoryVectorStore implements VectorStore {
-  private readonly records = new Map<string, { metadata: Record<string, unknown>; embedding: number[] }>();
+export class InMemoryMemoryStore implements MemoryStore {
+  private readonly records = new Map<
+    string,
+    { memory: StoredMemory; embedding: number[]; stats: MemoryStats }
+  >();
 
   async put(memory: StoredMemory, embedding: number[]): Promise<void> {
-    // Both real stores refuse an over-budget memory here, so the layers above
-    // must meet it here too — otherwise a service test stores what neither
-    // would have taken.
-    assertWithinMetadataBudget(memory);
-    const metadata = toMetadata(memory);
-    // The service refuses these, and refuses the whole write rather than the
-    // one field. Enforced here too because the first version of this fake did
-    // not, and a memory saved without tags failed only once it reached AWS.
-    for (const [key, value] of Object.entries(metadata)) {
-      if (Array.isArray(value) && value.length === 0) {
-        throw new VectorStoreError(`empty arrays are not allowed in metadata (key "${key}")`);
-      }
-    }
-    this.records.set(vectorKey(memory.tenantId, memory.id), { metadata, embedding });
+    assertWithinContentBudget(memory);
+    const createdAt = Number.isFinite(Date.parse(memory.createdAt))
+      ? memory.createdAt
+      : new Date(0).toISOString();
+    this.records.set(`${memory.tenantId}#${memory.id}`, {
+      memory: { ...memory, createdAt, tags: [...memory.tags] },
+      embedding: [...embedding],
+      stats: { accessCount: 0, lastAccessedAt: "" },
+    });
   }
 
-  async query(tenantId: string, embedding: number[], topK: number): Promise<VectorHit[]> {
-    const hits: VectorHit[] = [];
-    for (const [key, record] of this.records) {
-      const memory = fromMetadata(key, record.metadata);
-      if (!memory || memory.tenantId !== tenantId) {
+  async query(
+    tenantId: string,
+    embedding: number[],
+    topK: number,
+    conversation?: string,
+  ): Promise<MemoryHit[]> {
+    const hits: MemoryHit[] = [];
+    for (const record of this.records.values()) {
+      if (record.memory.tenantId !== tenantId || !visibleTo(record.memory, conversation)) {
         continue;
       }
       // Embeddings from the fake embedder are unit vectors, so the dot product
       // is the cosine similarity — the same number the real store derives from
       // the distance it returns.
-      hits.push({ memory, similarity: dot(embedding, record.embedding) });
+      hits.push({
+        memory: { ...record.memory, tags: [...record.memory.tags] },
+        similarity: dot(embedding, record.embedding),
+        stats: { ...record.stats },
+      });
     }
     // Sorted to pick the nearest `topK`, then handed back worst-first. The port
     // promises the nearest neighbours and no order at all, and a fake that
@@ -121,20 +72,60 @@ export class InMemoryVectorStore implements VectorStore {
   async get(tenantId: string, ids: string[]): Promise<StoredMemory[]> {
     const found: StoredMemory[] = [];
     for (const id of ids) {
-      const key = vectorKey(tenantId, id);
-      const record = this.records.get(key);
-      const memory = record ? fromMetadata(key, record.metadata) : undefined;
-      if (memory && memory.tenantId === tenantId) {
-        found.push(memory);
+      const record = this.records.get(`${tenantId}#${id}`);
+      if (record?.memory.tenantId === tenantId) {
+        found.push({ ...record.memory, tags: [...record.memory.tags] });
       }
     }
     return found;
   }
 
+  async list(tenantId: string, options: ListMemoriesOptions): Promise<StoredMemory[]> {
+    return [...this.records.values()]
+      .map((record) => record.memory)
+      .filter(
+        (memory) =>
+          memory.tenantId === tenantId &&
+          visibleTo(memory, options.conversation) &&
+          (!options.memoryType || memory.memoryType === options.memoryType),
+      )
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt) || b.id.localeCompare(a.id))
+      .slice(0, options.limit)
+      .map((memory) => ({ ...memory, tags: [...memory.tags] }));
+  }
+
   async delete(tenantId: string, ids: string[]): Promise<void> {
     for (const id of ids) {
-      this.records.delete(vectorKey(tenantId, id));
+      this.records.delete(`${tenantId}#${id}`);
     }
+  }
+
+  async touch(tenantId: string, ids: string[], accessedAt: string): Promise<void> {
+    for (const id of ids) {
+      const record = this.records.get(`${tenantId}#${id}`);
+      if (record) {
+        record.stats = {
+          accessCount: record.stats.accessCount + 1,
+          lastAccessedAt:
+            record.stats.lastAccessedAt > accessedAt ? record.stats.lastAccessedAt : accessedAt,
+        };
+      }
+    }
+  }
+
+  async count(tenantId: string, conversation?: string): Promise<MemoryCounts> {
+    const counts: MemoryCounts = {};
+    for (const { memory } of this.records.values()) {
+      if (memory.tenantId === tenantId && visibleTo(memory, conversation) && isMemoryType(memory.memoryType)) {
+        counts[memory.memoryType] = (counts[memory.memoryType] ?? 0) + 1;
+      }
+    }
+    return counts;
+  }
+
+  statsFor(tenantId: string, id: string): MemoryStats | undefined {
+    const stats = this.records.get(`${tenantId}#${id}`)?.stats;
+    return stats ? { ...stats } : undefined;
   }
 
   get size(): number {

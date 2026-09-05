@@ -1,32 +1,25 @@
 /**
  * The entrypoint: read the environment, wire the layers, listen, and shut down
- * without dropping counters on the floor.
+ * cleanly.
  *
- * Configuration is validated before anything binds a port, so a missing bucket
- * name — or a database that cannot be reached — stops a rollout at the
+ * Configuration is validated before anything binds a port, so a missing database
+ * URL — or a database that cannot be reached — stops a rollout at the
  * readiness probe rather than surfacing as a tool error inside somebody's
  * agent run.
  */
 
-import { hostname } from "node:os";
-import { randomUUID } from "node:crypto";
 import { describeAuth } from "./auth.js";
 import { ConfigError, loadConfig } from "./config.js";
-import { KnowledgeBaseRetriever, knowledgeBaseInvoker } from "./docs.js";
 import { BedrockEmbedder, bedrockInvoker, HttpEmbedder, type Embedder } from "./embeddings.js";
 import { createMcpServer } from "./server.js";
-import { S3MemoryService } from "./service.js";
-import { openStores } from "./store/backend.js";
-import { StatsTracker } from "./store/stats.js";
+import { MemoryManager } from "./service.js";
+import { openPgStore } from "./store/pg.js";
 import { gracefulShutdown } from "./shutdown.js";
 import { SERVER_NAME, SERVER_VERSION } from "./version.js";
-import { callTool, toolCatalogue } from "./tools.js";
+import { callTool, TOOLS } from "./tools.js";
 
 /**
- * How long in-flight requests get before the counter flush runs regardless.
- *
- * Well inside Kubernetes' 30s default grace period: the point is to flush and
- * exit on our own terms rather than to be SIGKILLed mid-drain.
+ * How long in-flight requests get before the process exits regardless.
  */
 const SHUTDOWN_GRACE_MS = 10_000;
 
@@ -59,64 +52,31 @@ try {
 // Before the port is bound, like the configuration: a database this process
 // cannot reach, or a schema it may not create, is a failed boot and not a
 // pod that answers the health probe and fails every tool call.
-const stores = await openStores(config.storage, config.region).catch((error: unknown) => {
+const store = await openPgStore(config.databaseUrl).catch((error: unknown) => {
   console.error(`storage error: ${describeError(error)}`);
   return process.exit(1);
 });
-const { vectors, objects } = stores;
-
-const stats = new StatsTracker(objects, {
-  // Kubernetes sets HOSTNAME to the pod name. The random suffix distinguishes
-  // one boot from the next, so a restarted pod never rewrites a shard its
-  // previous life had already written — shards are append-only by construction.
-  podId: `${process.env.HOSTNAME ?? hostname()}-${randomUUID().slice(0, 8)}`,
-  flushMs: config.statsFlushMs,
-  compactThreshold: config.statsCompactThreshold,
-});
-stats.start();
 
 const embedder: Embedder =
   config.embedding.provider === "bedrock"
     ? new BedrockEmbedder({ ...config.embedding, invoke: bedrockInvoker(config.region) })
     : new HttpEmbedder(config.embedding);
 
-const service = new S3MemoryService(
-  vectors,
-  objects,
-  stats,
-  embedder,
-  config.recallMinSimilarity,
-);
-
-const docs = config.knowledgeBaseId
-  ? new KnowledgeBaseRetriever({
-      knowledgeBaseId: config.knowledgeBaseId,
-      invoke: knowledgeBaseInvoker(config.region),
-    })
-  : undefined;
-
-// Fixed for the process lifetime, which is what `initialize` promises with
-// `listChanged: false`.
-const catalogue = toolCatalogue(docs !== undefined);
+const service = new MemoryManager(store.memories, embedder, config.recallMinSimilarity);
 
 const server = createMcpServer({
   config,
   tools: {
-    definitions: () => catalogue,
-    call: (context, name, args) => callTool(service, context, name, args, docs),
+    definitions: () => TOOLS,
+    call: (context, name, args) => callTool(service, context, name, args),
   },
 });
 
 server.listen(config.port, () => {
   console.log(`${SERVER_NAME} v${SERVER_VERSION} listening on :${config.port} (POST /mcp)`);
   console.log(
-    `${stores.description} ` +
+    `${store.description} ` +
       `(${config.embedding.provider}:${config.embedding.model}, ${config.embedding.dimension}d)`,
-  );
-  console.log(
-    config.knowledgeBaseId
-      ? `docs: bedrock-kb://${config.knowledgeBaseId} (search_docs offered)`
-      : "docs: no KNOWLEDGE_BASE_ID — memories only, search_docs not offered",
   );
   // Always, not only when open: an operator reading logs to find out which mode
   // an instance is in should not have to infer it from a line that is missing.
@@ -128,16 +88,12 @@ server.listen(config.port, () => {
   }
 });
 
-// Counters are the only pod-local state worth saving, and a closed server is
-// what stops anything still incrementing them — but not at the price of never
-// flushing at all. See `shutdown.ts`.
-const leave = gracefulShutdown(server, stats, {
+const leave = gracefulShutdown(server, {
   graceMs: SHUTDOWN_GRACE_MS,
-  // The pool is drained after the flush that needed it, and never stands
-  // between the process and its exit: a connection that will not close is not
-  // worth the grace period.
+  // Pool shutdown never stands between the process and its exit: a connection
+  // that will not close is not worth another grace period.
   exit: (code) => {
-    void stores
+    void store
       .close()
       .catch(() => {})
       .finally(() => process.exit(code));

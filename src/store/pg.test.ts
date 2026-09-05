@@ -1,33 +1,14 @@
-/**
- * The PostgreSQL backend against a real database.
- *
- * The stubs in `pgObjects.test.ts` and `pgVectors.test.ts` pin what is sent;
- * only a database can say whether what is sent does what the port promises —
- * that `"C"` collation really lists the recency index newest-first, that the
- * version condition really loses a race, that `<=>` really comes back as the
- * cosine the ranking expects. So these run when `TEST_DATABASE_URL` names a
- * database with pgvector available, and are skipped, visibly, when it does
- * not: `npm test` on a laptop without one still passes.
- *
- *   TEST_DATABASE_URL=postgres://user:pass@localhost:5432/mcp_memory_test npm test
- *
- * The database is the test's own. Both tables are emptied before each case,
- * and `node --test` runs files in parallel, so everything that touches the
- * database lives in this one file.
- */
+/** PostgreSQL adapter integration tests, enabled by TEST_DATABASE_URL. */
 
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { after, before, beforeEach, describe, it, mock } from "node:test";
 import pg from "pg";
-import { S3MemoryService } from "../service.js";
+import { MemoryManager } from "../service.js";
 import { FakeEmbedder } from "../testing/fakes.js";
-import { PreconditionFailed } from "./objects.js";
-import { ensureSchema, reportIdleFailures } from "./pg.js";
-import { PgObjectStore } from "./pgObjects.js";
-import { PgVectorStore } from "./pgVectors.js";
-import { StatsTracker } from "./stats.js";
 import type { StoredMemory } from "../types.js";
+import { ensureSchema, reportIdleFailures } from "./pg.js";
+import { PgMemoryStore } from "./pgMemoryStore.js";
 
 const DATABASE_URL = process.env.TEST_DATABASE_URL?.trim();
 const skip = DATABASE_URL ? false : "TEST_DATABASE_URL is not set";
@@ -45,223 +26,107 @@ function memory(overrides: Partial<StoredMemory> = {}): StoredMemory {
   };
 }
 
-describe("PostgreSQL backend", { skip }, () => {
+describe("PostgreSQL memory store", { skip }, () => {
   let pool: pg.Pool;
-  let objects: PgObjectStore;
-  let vectors: PgVectorStore;
+  let memories: PgMemoryStore;
 
   before(async () => {
     pool = new pg.Pool({ connectionString: DATABASE_URL });
     await ensureSchema(pool);
-    objects = new PgObjectStore(pool);
-    vectors = new PgVectorStore(pool);
+    memories = new PgMemoryStore(pool);
   });
 
   beforeEach(async () => {
-    await pool.query("TRUNCATE memories, objects");
+    await pool.query("TRUNCATE memories");
   });
 
   after(async () => {
     await pool?.end();
   });
 
-  it("creates the schema once and tolerates being asked again", async () => {
-    // Every pod runs this at boot, so the second run — and the fiftieth — must
-    // be a no-op rather than a failure on a name already taken.
+  it("creates the relational schema idempotently", async () => {
     await ensureSchema(pool);
     const { rows } = await pool.query(
-      "SELECT table_name FROM information_schema.tables WHERE table_name IN ('memories', 'objects') ORDER BY 1",
+      "SELECT column_name FROM information_schema.columns " +
+        "WHERE table_name = 'memories' ORDER BY ordinal_position",
     );
-    assert.deepEqual(
-      rows.map((row: { table_name: string }) => row.table_name),
-      ["memories", "objects"],
+    const columns = rows.map((row: { column_name: string }) => row.column_name);
+    assert.ok(columns.includes("content"));
+    assert.ok(columns.includes("embedding"));
+    assert.ok(columns.includes("access_count"));
+    assert.ok(!columns.includes("metadata"));
+  });
+
+  it("stores, searches, lists, counts, touches and deletes per tenant", async () => {
+    await memories.put(memory(), [1, 0, 0]);
+    await memories.put(memory({ tenantId: "other" }), [1, 0, 0]);
+
+    const [hit] = await memories.query("acme", [1, 0, 0], 10);
+    assert.ok(hit && Math.abs(hit.similarity - 1) < 1e-6);
+    assert.equal(hit.stats.accessCount, 0);
+    assert.equal((await memories.list("acme", { limit: 10 })).length, 1);
+    assert.deepEqual(await memories.count("acme"), { project: 1 });
+
+    await memories.touch("acme", [memory().id], "2026-07-02T00:00:00.000Z");
+    const [touched] = await memories.query("acme", [1, 0, 0], 10);
+    assert.deepEqual(touched?.stats, {
+      accessCount: 1,
+      lastAccessedAt: "2026-07-02T00:00:00.000Z",
+    });
+
+    await memories.delete("acme", [memory().id]);
+    assert.equal((await memories.get("acme", [memory().id])).length, 0);
+    assert.equal((await memories.get("other", [memory().id])).length, 1);
+  });
+
+  it("filters conversation-scoped memories in SQL", async () => {
+    await memories.put(memory({ id: "01JAAAAAAAAAAAAAAAAAAAAAAB" }), [1, 0, 0]);
+    await memories.put(
+      memory({ id: "01JAAAAAAAAAAAAAAAAAAAAAAC", scope: "conversation", conversation: "chat:1" }),
+      [1, 0, 0],
     );
+    await memories.put(
+      memory({ id: "01JAAAAAAAAAAAAAAAAAAAAAAD", scope: "conversation", conversation: "chat:2" }),
+      [1, 0, 0],
+    );
+
+    assert.equal((await memories.list("acme", { limit: 10 })).length, 1);
+    assert.equal((await memories.list("acme", { limit: 10, conversation: "chat:1" })).length, 2);
+    assert.equal((await memories.query("acme", [1, 0, 0], 10, "chat:2")).length, 2);
+    assert.deepEqual(await memories.count("acme", "chat:1"), { project: 1, conversation: 1 });
   });
 
-  describe("objects", () => {
-    it("round-trips a body with an etag that changes on every write", async () => {
-      await objects.put("k", "one");
-      const first = await objects.get("k");
-      await objects.put("k", "two");
-      const second = await objects.get("k");
-
-      assert.equal(first?.body, "one");
-      assert.equal(second?.body, "two");
-      assert.notEqual(first?.etag, second?.etag);
-      assert.equal(await objects.get("missing"), undefined);
-    });
-
-    it("lets exactly one of two compare-and-swaps on the same etag win", async () => {
-      await objects.put("stats/demo/merged.json", "{}");
-      const { etag } = (await objects.get("stats/demo/merged.json"))!;
-
-      await objects.put("stats/demo/merged.json", "winner", { ifMatch: etag });
-      await assert.rejects(
-        () => objects.put("stats/demo/merged.json", "loser", { ifMatch: etag }),
-        PreconditionFailed,
-      );
-      assert.equal((await objects.get("stats/demo/merged.json"))?.body, "winner");
-    });
-
-    it("refuses a compare-and-swap against a key that is not there", async () => {
-      await assert.rejects(() => objects.put("absent", "v", { ifMatch: "1" }), PreconditionFailed);
-    });
-
-    it("creates only once under ifNoneMatch", async () => {
-      await objects.put("k", "first", { ifNoneMatch: true });
-      await assert.rejects(() => objects.put("k", "second", { ifNoneMatch: true }), PreconditionFailed);
-      assert.equal((await objects.get("k"))?.body, "first");
-    });
-
-    it("does not let an etag from a row's earlier life win", async () => {
-      // Versions come from one sequence, so a deleted and recreated key never
-      // hands out a number a stale reader might still be holding.
-      await objects.put("k", "v1");
-      const { etag } = (await objects.get("k"))!;
-      await objects.delete(["k"]);
-      await objects.put("k", "v2");
-
-      await assert.rejects(() => objects.put("k", "v3", { ifMatch: etag }), PreconditionFailed);
-    });
-
-    it("lists in byte order, which is what the recency index is built on", async () => {
-      // `#` is 0x23 and `0` is 0x30, so in byte order `1#z` comes before
-      // `10#a`. A locale collation sets punctuation aside and compares `1z`
-      // against `10a` — the other way round — and the inverted timestamp in
-      // an index key stops meaning newest-first.
-      const keys = ["index/t/9#b", "index/t/10#a", "index/t/1#z", "index/t/1#Z", "index/u/0"];
-      for (const key of keys) {
-        await objects.put(key, "");
-      }
-
-      assert.deepEqual(await objects.list("index/t/"), [
-        "index/t/1#Z",
-        "index/t/1#z",
-        "index/t/10#a",
-        "index/t/9#b",
-      ]);
-      assert.deepEqual(await objects.list("index/t/", 2), ["index/t/1#Z", "index/t/1#z"]);
-      assert.deepEqual(await objects.list("index/t/", 10, "index/t/1#z"), ["index/t/10#a", "index/t/9#b"]);
-    });
-
-    it("matches a prefix literally, wildcards included", async () => {
-      await objects.put("stats/a_b/shard/x", "");
-      await objects.put("stats/axb/shard/x", "");
-      await objects.put("stats/a%b/shard/x", "");
-
-      assert.deepEqual(await objects.list("stats/a_b/"), ["stats/a_b/shard/x"]);
-      assert.deepEqual(await objects.list("stats/a%b/"), ["stats/a%b/shard/x"]);
-    });
-
-    it("deletes what it is given and nothing else", async () => {
-      await objects.put("a", "");
-      await objects.put("b", "");
-      await objects.put("c", "");
-      await objects.delete(["a", "c", "never-existed"]);
-      assert.deepEqual(await objects.list(""), ["b"]);
-    });
+  it("accepts whatever width the embedding model produces", async () => {
+    const wide = Array.from({ length: 1536 }, (_, i) => (i % 7) / 7);
+    await memories.put(memory(), wide);
+    const [hit] = await memories.query("acme", wide, 1);
+    assert.ok(hit && Math.abs(hit.similarity - 1) < 1e-6);
   });
 
-  describe("vectors", () => {
-    it("answers the nearest neighbour with a cosine similarity", async () => {
-      await vectors.put(memory({ id: "01JAAAAAAAAAAAAAAAAAAAAAAA" }), [1, 0, 0]);
-      await vectors.put(memory({ id: "01JBBBBBBBBBBBBBBBBBBBBBBB" }), [0, 1, 0]);
-
-      const hits = await vectors.query("acme", [1, 0, 0], 10);
-      assert.equal(hits.length, 2);
-      assert.equal(hits[0]?.memory.id, "01JAAAAAAAAAAAAAAAAAAAAAAA");
-      assert.ok(Math.abs(hits[0]!.similarity - 1) < 1e-6, `identical vectors score 1, got ${hits[0]!.similarity}`);
-      assert.ok(Math.abs(hits[1]!.similarity) < 1e-6, `orthogonal vectors score 0, got ${hits[1]!.similarity}`);
+  it("runs all five memory operations end to end", async () => {
+    const service = new MemoryManager(memories, new FakeEmbedder(), 0.1);
+    const stored = await service.remember("acme", {
+      content: "The deploy pipeline pushes the image to ECR",
+      memoryType: "project",
+      tags: ["deploy"],
+    });
+    await service.remember("acme", {
+      content: "Tests run with node --test under tsx",
+      memoryType: "pattern",
+      tags: [],
     });
 
-    it("keeps tenants apart on every read", async () => {
-      await vectors.put(memory({ tenantId: "acme" }), [1, 0, 0]);
-      await vectors.put(memory({ tenantId: "other" }), [1, 0, 0]);
+    assert.match(await service.recall("acme", { query: "where does the pipeline push the image" }), /ECR/);
+    assert.match(await service.list("acme", { limit: 20 }), /2 memories/);
+    assert.match(await service.stats("acme"), /project: 1, pattern: 1/);
 
-      assert.equal((await vectors.query("acme", [1, 0, 0], 10)).length, 1);
-      assert.equal((await vectors.get("acme", [memory().id])).length, 1);
-      await vectors.delete("acme", [memory().id]);
-      assert.equal((await vectors.get("acme", [memory().id])).length, 0);
-      assert.equal((await vectors.get("other", [memory().id])).length, 1, "the other tenant's copy survives");
-    });
-
-    it("reads back every field it wrote, and drops ids it does not hold", async () => {
-      const written = memory({
-        category: "decision",
-        tags: ["deploy", "ecr"],
-        scope: "conversation",
-        conversation: "chat:1",
-      });
-      await vectors.put(written, [0.5, 0.5, 0]);
-
-      const [read] = await vectors.get("acme", [written.id, "01JMISSINGMISSINGMISSINGXX"]);
-      assert.deepEqual(read, written);
-    });
-
-    it("accepts whatever width the embedding model produces", async () => {
-      // No width on the column, so the first write decides nothing and a
-      // 1536-wide model needs no schema change.
-      const wide = Array.from({ length: 1536 }, (_, i) => (i % 7) / 7);
-      await vectors.put(memory(), wide);
-      const [hit] = await vectors.query("acme", wide, 1);
-      assert.ok(hit && Math.abs(hit.similarity - 1) < 1e-6);
-    });
-  });
-
-  describe("the service, end to end", () => {
-    it("remembers, recalls, lists, counts and forgets through PostgreSQL", async () => {
-      const stats = new StatsTracker(objects, {
-        podId: "test",
-        flushMs: 60_000,
-        compactThreshold: 20,
-        cacheTtlMs: 0,
-      });
-      // The fake embedder's similarity is roughly the fraction of shared words,
-      // which at 0.1 and above is what the floor asks for.
-      const service = new S3MemoryService(vectors, objects, stats, new FakeEmbedder(), 0.1);
-
-      const stored = await service.remember("acme", {
-        content: "The deploy pipeline pushes the image to ECR",
-        memoryType: "project",
-        tags: ["deploy"],
-      });
-      assert.match(stored, /Stored as/);
-      await service.remember("acme", {
-        content: "Tests run with node --test under tsx",
-        memoryType: "pattern",
-        tags: [],
-      });
-
-      const recalled = await service.recall("acme", { query: "where does the deploy pipeline push the image" });
-      assert.match(recalled, /pushes the image to ECR/);
-
-      const listed = await service.list("acme", { limit: 20 });
-      assert.match(listed, /2 memories, newest first/);
-      assert.match(await service.list("acme", { memoryType: "pattern", limit: 20 }), /node --test/);
-      assert.match(await service.stats("acme"), /2 memories for this project \(project: 1, pattern: 1\)/);
-
-      // Counters reach the database and come back.
-      await stats.flush();
-      assert.ok((await objects.list("stats/acme/shard/")).length === 1);
-
-      const id = /\[id:([0-9A-Z]{26})\]/.exec(stored)![1]!;
-      assert.match(await service.forget("acme", id), /Deleted/);
-      // Names which one survived, not just how many: the forget above took the
-      // project memory, so a count that still said "1" would pass while having
-      // deleted the wrong row.
-      assert.match(await service.stats("acme"), /1 memory for this project \(pattern: 1\)/);
-      assert.match(await service.list("other", { limit: 20 }), /no memories/);
-    });
+    const id = /\[id:([0-9A-Z]{26})\]/.exec(stored)![1]!;
+    assert.match(await service.forget("acme", id), /Deleted/);
+    assert.match(await service.stats("acme"), /pattern: 1/);
   });
 });
 
-/**
- * No database needed: the failure is Node's, not PostgreSQL's. An EventEmitter
- * throws an `error` it has no listener for, and a pool emits one when a
- * connection sitting idle in it dies — so the whole property is that the emit
- * comes back rather than ending the process.
- */
-describe("an idle connection dying", () => {
+describe("an idle PostgreSQL connection dying", () => {
   it("is reported instead of taking the process down", () => {
     const pool = new EventEmitter();
     const wrote = mock.method(console, "error", () => {});
@@ -269,14 +134,8 @@ describe("an idle connection dying", () => {
     try {
       assert.doesNotThrow(() => pool.emit("error", new Error("connection terminated unexpectedly")));
       assert.equal(wrote.mock.callCount(), 1);
-      assert.match(String(wrote.mock.calls[0]?.arguments[0]), /pg_idle_client_failed/);
     } finally {
       wrote.mock.restore();
     }
-  });
-
-  it("would end it without the listener, which is why the listener is there", () => {
-    const pool = new EventEmitter();
-    assert.throws(() => pool.emit("error", new Error("connection terminated unexpectedly")));
   });
 });

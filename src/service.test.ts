@@ -8,35 +8,24 @@
 import assert from "node:assert/strict";
 import { beforeEach, describe, it } from "node:test";
 import type { Embedder } from "./embeddings.js";
-import { invertedTime, ulid } from "./id.js";
-import { S3MemoryService, STATS_SCAN_CAP } from "./service.js";
-import { StatsTracker } from "./store/stats.js";
-import { FakeEmbedder, InMemoryObjectStore, InMemoryVectorStore } from "./testing/fakes.js";
-import type { VectorStore } from "./store/vectors.js";
+import { ulid } from "./id.js";
+import { MemoryManager } from "./service.js";
+import { FakeEmbedder, InMemoryMemoryStore } from "./testing/fakes.js";
+import type { MemoryStore } from "./store/memoryStore.js";
 import type { StoredMemory } from "./types.js";
 
 const START = Date.parse("2026-07-01T00:00:00.000Z");
 
 let clock: number;
-let vectors: InMemoryVectorStore;
-let objects: InMemoryObjectStore;
-let stats: StatsTracker;
-let service: S3MemoryService;
+let vectors: InMemoryMemoryStore;
+let service: MemoryManager;
 
 beforeEach(() => {
   clock = START;
-  vectors = new InMemoryVectorStore();
-  objects = new InMemoryObjectStore();
-  stats = new StatsTracker(objects, {
-    podId: "pod-test",
-    flushMs: 30_000,
-    compactThreshold: 20,
-    cacheTtlMs: 0,
-    now: () => clock,
-  });
+  vectors = new InMemoryMemoryStore();
   // The fake embedder's scale is not Titan's, so the floor is set for it: its
   // unrelated pairs land near 0 and its related ones well above 0.3.
-  service = new S3MemoryService(vectors, objects, stats, new FakeEmbedder(), 0.3, () => clock);
+  service = new MemoryManager(vectors, new FakeEmbedder(), 0.3, () => clock);
 });
 
 function remember(
@@ -168,12 +157,11 @@ describe("conversation scope", () => {
     assert.match(stored, /Stored as/);
   });
 
-  it("forgets a conversation memory by id like any other, index entry included", async () => {
+  it("forgets a conversation memory by id like any other", async () => {
     const result = await remember("Temporary note", { scope: "conversation", conversation: THREAD });
     const id = /Stored as ([0-9A-Z]{26})/.exec(result)![1]!;
     assert.match(await service.forget("alpha", id), /Deleted/);
     assert.equal(vectors.size, 0);
-    assert.equal(await objects.list("index/alpha/", 100).then((keys) => keys.length), 0);
   });
 });
 
@@ -203,7 +191,7 @@ describe("remember", () => {
   });
 
   it("finds the nearest neighbour rather than taking whichever came back first", async () => {
-    // `VectorStore.query` promises the nearest neighbours and no order at all,
+    // `MemoryStore.query` promises the nearest neighbours and no order at all,
     // and dedup is the one caller whose wrong pick is silent: it compares
     // against a hit that is not the closest, sees nothing near enough, and
     // writes a second copy of a fact already stored. Several unrelated
@@ -218,13 +206,6 @@ describe("remember", () => {
     assert.equal(vectors.size, 3, "a near-duplicate must not accumulate");
   });
 
-  it("writes the recency index only after the memory itself", async () => {
-    // Order matters: an index entry with no memory behind it shows up in a
-    // listing as something that cannot be read.
-    await remember("Something worth keeping around for later");
-    const indexWrites = objects.writes.filter((key) => key.startsWith("index/"));
-    assert.equal(indexWrites.length, 1);
-  });
 });
 
 describe("dedup does not act on the cosine alone", () => {
@@ -239,7 +220,7 @@ describe("dedup does not act on the cosine alone", () => {
   };
 
   const collapsed = () =>
-    new S3MemoryService(vectors, objects, stats, collapsing, 0.3, () => clock);
+    new MemoryManager(vectors, collapsing, 0.3, () => clock);
 
   const store = (content: string) =>
     collapsed().remember("alpha", { content, memoryType: "project", tags: [] });
@@ -323,8 +304,8 @@ describe("recall", () => {
     await remember("The deploy pipeline pushes to ECR then dispatches to ArgoCD");
     await service.recall("alpha", { query: "deploy pipeline pushes to ECR then dispatches" });
 
-    const counters = await stats.load("alpha");
-    assert.equal([...counters.values()][0]?.accessCount, 1);
+    const [memory] = await vectors.list("alpha", { limit: 1 });
+    assert.equal(memory ? vectors.statsFor("alpha", memory.id)?.accessCount : undefined, 1);
   });
 
   it("returns the one clear answer in precision and its neighbours in exploratory", async () => {
@@ -371,7 +352,6 @@ describe("recall", () => {
       trustBase: 1,
     };
     await vectors.put(broken, await new FakeEmbedder().embed(broken.content));
-    await objects.put(`index/alpha/${invertedTime(START)}#${broken.id}#project`, "");
 
     clock += 1000;
     await remember("Rolling deploys drain in-flight streams before the pod exits");
@@ -435,26 +415,23 @@ describe("recall", () => {
 
 describe("recall does not assume the store sorts", () => {
   it("gates against the strongest hit, not the first one handed over", async () => {
-    // `VectorStore.query` promises the nearest neighbours, not an order. Real
-    // S3 Vectors does sort; nothing in the contract says so, so this hands them
-    // over backwards. Both hits have to clear the floor for the mistake to be
+    // `MemoryStore.query` promises the nearest neighbours, not an order. The
+    // PostgreSQL adapter sorts, but the interface does not promise it, so this
+    // hands results over backwards. Both hits have to clear the floor for the mistake to be
     // reachable — otherwise the floor removes the weak one first and the top is
     // right by accident.
-    const backing = new InMemoryVectorStore();
-    const reversing: VectorStore = {
+    const backing = new InMemoryMemoryStore();
+    const reversing: MemoryStore = {
       put: (memory, embedding) => backing.put(memory, embedding),
       get: (t, ids) => backing.get(t, ids),
       delete: (t, ids) => backing.delete(t, ids),
-      query: async (t, embedding, topK) => (await backing.query(t, embedding, topK)).reverse(),
+      query: async (t, embedding, topK, conversation) =>
+        (await backing.query(t, embedding, topK, conversation)).reverse(),
+      list: (t, options) => backing.list(t, options),
+      touch: (t, ids, at) => backing.touch(t, ids, at),
+      count: (t, conversation) => backing.count(t, conversation),
     };
-    const shuffled = new S3MemoryService(
-      reversing,
-      objects,
-      stats,
-      new FakeEmbedder(),
-      0.3,
-      () => clock,
-    );
+    const shuffled = new MemoryManager(reversing, new FakeEmbedder(), 0.3, () => clock);
     const put = (content: string) =>
       shuffled.remember("alpha", { content, memoryType: "project", tags: [] });
 
@@ -517,11 +494,9 @@ describe("list", () => {
     assert.match(await service.list("alpha", { limit: 2 }), /2 memories/);
   });
 
-  it("pages past the listing limit to fill a type filter", async () => {
-    // The type sits at the end of an index key, so it cannot narrow the prefix.
-    // Taking one page and filtering it would silently return nothing here, which
-    // reads as "this project has no patterns" rather than "I only looked at the
-    // first page". Seeded directly: 1005 embeddings would be beside the point.
+  it("applies the type filter before the listing limit", async () => {
+    // The one pattern is older than more rows than the requested limit. A store
+    // that limits first and filters in memory would quietly return nothing.
     const seed = async (memoryType: "project" | "pattern", at: number) => {
       const memory: StoredMemory = {
         id: ulid(at),
@@ -533,13 +508,9 @@ describe("list", () => {
         trustBase: 1,
       };
       await vectors.put(memory, []);
-      await objects.put(
-        `index/alpha/${invertedTime(at)}#${memory.id}#${memoryType}`,
-        "",
-      );
     };
 
-    // The one pattern is the oldest, so it sorts last — past the first page.
+    // The one pattern is the oldest, so it sorts after every project memory.
     await seed("pattern", START);
     for (let i = 1; i <= 1005; i++) {
       await seed("project", START + i * 1000);
@@ -560,14 +531,13 @@ describe("list", () => {
 });
 
 describe("forget", () => {
-  it("removes the memory and its index entry", async () => {
+  it("removes the memory", async () => {
     const stored = await remember("A fact that will shortly turn out to be wrong");
     const id = /id:([0-9A-HJKMNP-TV-Z]{26})/.exec(stored)?.[1];
     assert.ok(id);
 
     assert.match(await service.forget("alpha", id), /Deleted/);
     assert.equal(vectors.size, 0);
-    assert.equal((await objects.list("index/alpha/")).length, 0);
     assert.match(await service.list("alpha", { limit: 10 }), /no memories/i);
   });
 
@@ -575,33 +545,6 @@ describe("forget", () => {
     const result = await service.forget("alpha", "0000000000000000000000000");
     assert.match(result, /No memory with id/);
     assert.match(result, /Nothing was deleted/);
-  });
-
-  it("reports the deletion that happened when only the index cleanup failed", async () => {
-    // The vector goes first, so by the time the index key fails to delete the
-    // memory is already unreachable. Calling that a failed deletion tells the
-    // model to try again at something that is done, and invites it to keep the
-    // fact it was asked to forget.
-    const stored = await remember("A fact that will shortly turn out to be wrong");
-    const id = /id:([0-9A-HJKMNP-TV-Z]{26})/.exec(stored)![1]!;
-
-    const brittle = new S3MemoryService(
-      vectors,
-      {
-        get: (key) => objects.get(key),
-        put: (key, body, opts) => objects.put(key, body, opts),
-        list: (prefix, limit, after) => objects.list(prefix, limit, after),
-        delete: () => Promise.reject(new Error("S3 DeleteObjects: throttled")),
-      },
-      stats,
-      new FakeEmbedder(),
-      0.3,
-      () => clock,
-    );
-
-    assert.match(await brittle.forget("alpha", id), /Deleted/);
-    assert.equal(vectors.size, 0, "the memory must actually be gone");
-    assert.equal((await objects.list("index/alpha/")).length, 1, "and the orphan key left behind");
   });
 
   it("cannot delete another tenant's memory even given its id", async () => {
@@ -632,19 +575,4 @@ describe("stats", () => {
     assert.match(await service.stats("beta"), /no memories/i);
   });
 
-  it("says so rather than reporting a truncated total as exact", async () => {
-    // Counting by type means listing every key, so there is a stopping point.
-    // Past it the number is a floor — and a floor presented as a count is a
-    // wrong answer the caller has no way to notice. Seeded as bare index keys:
-    // 10,001 embeddings would be beside the point.
-    for (let i = 0; i <= STATS_SCAN_CAP; i++) {
-      const at = START + i * 1000;
-      await objects.put(`index/alpha/${invertedTime(at)}#${ulid(at)}#project`, "");
-    }
-
-    const result = await service.stats("alpha");
-    assert.match(result, /At least/);
-    assert.match(result, /lower bound/);
-    assert.match(result, new RegExp(`stopped at ${STATS_SCAN_CAP} keys`));
-  });
 });

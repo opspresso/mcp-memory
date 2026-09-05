@@ -1,7 +1,7 @@
 /**
  * Everything this server reads from its environment, validated once at boot.
  *
- * Fail-fast rather than on first use: a missing bucket name should stop a
+ * Fail-fast rather than on first use: a missing database URL should stop a
  * rollout at the readiness probe, not surface as a tool error inside somebody's
  * agent run half an hour later.
  *
@@ -16,14 +16,10 @@ export interface Config {
   port: number;
   /** Shared secret callers must present. Unset means no authentication — see `auth.ts`. */
   apiKey: string | undefined;
-  /** The one AWS region: Bedrock, the knowledge base, and the S3 stores when those are in use. */
+  /** AWS region used only when Bedrock supplies embeddings. */
   region: string;
-  storage: StorageConfig;
-  /**
-   * Bedrock Knowledge Base backing `search_docs`. Unset means memories-only:
-   * the tool is not offered at all, and the SDK behind it is never loaded.
-   */
-  knowledgeBaseId: string | undefined;
+  /** PostgreSQL connection URL. The schema is created on boot. */
+  databaseUrl: string;
   embedding: EmbeddingConfig;
   /**
    * The cosine similarity below which a hit is not relevant to the query at all.
@@ -42,47 +38,14 @@ export interface Config {
    * few you know are absent, and put this between the two clusters.
    */
   recallMinSimilarity: number;
-  /** How often a pod pushes its accumulated counters to its own shard. */
-  statsFlushMs: number;
-  /** Shard count past which a reader compacts them into one object. */
-  statsCompactThreshold: number;
 }
-
-/**
- * Where the memories and the counters live.
- *
- * Selected by presence rather than by a mode switch: a `DATABASE_URL` names a
- * PostgreSQL database and is the whole of what that backend needs, so asking
- * for a second variable to say "and use it" would be one more way for the two
- * to disagree. Without one the S3 pair is read exactly as it always was.
- *
- * The two are not mixed. One backend holds both the vectors and the objects,
- * because the write order `service.ts` relies on — the vector first, the index
- * entry after — is a promise about one store's failures, not two.
- */
-export type StorageConfig =
-  | {
-      backend: "s3";
-      /** S3 Vectors bucket holding the memories themselves. */
-      vectorBucket: string;
-      vectorIndex: string;
-      /** Ordinary S3 bucket holding the access counters and the recency index. */
-      stateBucket: string;
-    }
-  | {
-      backend: "postgres";
-      /** A libpq connection URL. The schema is created on boot — see `store/pg.ts`. */
-      databaseUrl: string;
-    };
 
 /**
  * Where embeddings come from.
  *
- * `dimension` on either must equal the dimension the vector index was created
- * with. S3 Vectors fixes that at creation and will not change it, so a mismatch
- * is not a degraded search — it is every write failing. PostgreSQL stores a
- * vector at whatever width it arrived with and refuses to compare two that
- * differ, so the same mismatch fails every *query* instead.
+ * PostgreSQL stores a vector at whatever width it arrived with and refuses to
+ * compare vectors whose dimensions differ. Changing models therefore requires
+ * clearing or re-embedding existing memories.
  */
 export type EmbeddingConfig =
   | { provider: "bedrock"; model: string; dimension: number }
@@ -157,39 +120,13 @@ function loadEmbedding(env: NodeJS.ProcessEnv): EmbeddingConfig {
   throw new ConfigError(`EMBEDDING_PROVIDER must be "bedrock" or "openai", got "${provider}"`);
 }
 
-function loadStorage(env: NodeJS.ProcessEnv): StorageConfig {
-  const databaseUrl = env.DATABASE_URL?.trim();
-  if (databaseUrl) {
-    return { backend: "postgres", databaseUrl };
-  }
-  // Neither named is its own message. Reporting `VECTOR_BUCKET is required`
-  // to someone who meant to configure PostgreSQL sends them to the wrong
-  // documentation; with one bucket named, the S3 path is what was meant and
-  // the missing one is the right thing to say.
-  if (!env.VECTOR_BUCKET?.trim() && !env.STATE_BUCKET?.trim()) {
-    throw new ConfigError(
-      "no storage is configured: set DATABASE_URL for PostgreSQL, " +
-        "or VECTOR_BUCKET and STATE_BUCKET for S3",
-    );
-  }
-  return {
-    backend: "s3",
-    vectorBucket: required(env, "VECTOR_BUCKET"),
-    vectorIndex: env.VECTOR_INDEX?.trim() || "memories",
-    stateBucket: required(env, "STATE_BUCKET"),
-  };
-}
-
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   return {
     port: integer(env, "PORT", 3000),
     apiKey: env.MCP_API_KEY?.trim() || undefined,
     region: env.AWS_REGION?.trim() || "ap-northeast-2",
-    storage: loadStorage(env),
-    knowledgeBaseId: env.KNOWLEDGE_BASE_ID?.trim() || undefined,
+    databaseUrl: required(env, "DATABASE_URL"),
     embedding: loadEmbedding(env),
     recallMinSimilarity: ratio(env, "RECALL_MIN_SIMILARITY", 0.1),
-    statsFlushMs: integer(env, "STATS_FLUSH_MS", 30_000),
-    statsCompactThreshold: integer(env, "STATS_COMPACT_THRESHOLD", 20),
   };
 }

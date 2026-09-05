@@ -20,8 +20,7 @@ import { loadConfig } from "./config.js";
 import { createMcpServer, type ToolHandler } from "./server.js";
 
 const BASE_ENV = {
-  VECTOR_BUCKET: "vectors",
-  STATE_BUCKET: "state",
+  DATABASE_URL: "postgres://memory:memory@postgres/memory",
   EMBEDDING_BASE_URL: "https://llm.example/v1",
   EMBEDDING_API_KEY: "k",
 } as NodeJS.ProcessEnv;

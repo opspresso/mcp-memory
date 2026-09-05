@@ -36,18 +36,15 @@ describe("HttpEmbedder", () => {
     });
   });
 
-  it("names the index's immutability when the dimension does not match", async () => {
-    // The most expensive misconfiguration available here: an index's dimension
-    // cannot be changed, so the message has to say that rather than just
-    // reporting a number mismatch.
+  it("names the required re-embedding when the dimension does not match", async () => {
     const error = await embedder((async () =>
       jsonResponse({ data: [{ embedding: [1, 2] }] })) as unknown as typeof fetch)
       .embed("hello")
       .catch((e: unknown) => e);
 
     assert.ok(error instanceof EmbeddingError);
-    assert.match(error.message, /returned 2 dimensions but the vector index expects 3/);
-    assert.match(error.message, /cannot be changed after creation/);
+    assert.match(error.message, /returned 2 dimensions but this deployment expects 3/);
+    assert.match(error.message, /clear or re-embed existing memories/);
   });
 
   it("carries the provider's explanation through, bounded", async () => {
@@ -71,8 +68,7 @@ describe("HttpEmbedder", () => {
   });
 
   it("rejects an all-zero vector", async () => {
-    // S3 Vectors refuses these under the cosine metric, so catching it here
-    // turns an opaque AWS rejection into a statement about the model.
+    // Cosine distance cannot rank an all-zero vector.
     const error = await embedder((async () =>
       jsonResponse({ data: [{ embedding: [0, 0, 0] }] })) as unknown as typeof fetch)
       .embed("hello")
@@ -101,9 +97,7 @@ describe("BedrockEmbedder", () => {
     return new BedrockEmbedder({ model: "amazon.titan-embed-text-v2:0", dimension, invoke });
   }
 
-  it("asks Titan for the index's dimension rather than taking the model default", async () => {
-    // Titan v2 answers 1024 unless told otherwise. An index built at 512 would
-    // reject every write, and the request is the only place to say so.
+  it("asks Titan for the configured dimension rather than taking the model default", async () => {
     let body: Record<string, unknown> | undefined;
     const result = await bedrock(async (raw) => {
       body = JSON.parse(raw);
@@ -113,17 +107,17 @@ describe("BedrockEmbedder", () => {
     assert.deepEqual(result, [0.1, 0.2, 0.3]);
     assert.equal(body?.inputText, "hello");
     assert.equal(body?.dimensions, 3);
-    assert.equal(body?.normalize, true, "the index metric is cosine");
+    assert.equal(body?.normalize, true, "the database metric is cosine");
   });
 
-  it("names the index's immutability when the dimension does not match", async () => {
+  it("names the required re-embedding when the dimension does not match", async () => {
     const error = await bedrock(async () => ({ embedding: [1, 2] }))
       .embed("hello")
       .catch((e: unknown) => e);
 
     assert.ok(error instanceof EmbeddingError);
-    assert.match(error.message, /returned 2 dimensions but the vector index expects 3/);
-    assert.match(error.message, /cannot be changed after creation/);
+    assert.match(error.message, /returned 2 dimensions but this deployment expects 3/);
+    assert.match(error.message, /clear or re-embed existing memories/);
   });
 
   it("rejects a response with no embedding in it", async () => {

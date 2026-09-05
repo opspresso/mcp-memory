@@ -1,21 +1,17 @@
 /**
- * What the five memory tools actually do, and the only place the stores are combined.
+ * What the five memory tools actually do.
  *
- * The shape of every operation follows from one decision: memories are
- * immutable. Nothing here updates a stored memory. `remember` writes a new one
- * or declines to; `forget` removes one; everything that changes with use is a
- * counter in `stats.ts`. That is what lets several pods serve the same tenant
- * with no coordination between them.
+ * Memories are immutable except for access statistics, which PostgreSQL
+ * increments atomically. `remember` writes a new one or declines to and
+ * `forget` removes one.
  *
  * Results are returned as text rather than JSON. The consumer is a model, the
  * text is what lands in its context, and prose costs fewer tokens than the same
  * facts wrapped in braces and quotes.
  */
 
-import { conversationKeyPart } from "./conversation.js";
 import type { Embedder } from "./embeddings.js";
-import { invertedTime, ulid, ulidTime } from "./id.js";
-import { logError } from "./log.js";
+import { ulid } from "./id.js";
 import {
   accessScore,
   compositeScore,
@@ -28,11 +24,9 @@ import {
   relativeStanding,
   TRUST_MANUAL,
 } from "./ranking.js";
-import type { ObjectStore } from "./store/objects.js";
-import { StatsTracker } from "./store/stats.js";
-import type { VectorHit, VectorStore } from "./store/vectors.js";
+import type { MemoryHit, MemoryStore } from "./store/memoryStore.js";
 import type { MemoryScope, MemoryType, RankedMemory, RecallMode, StoredMemory } from "./types.js";
-import { MEMORY_TYPES } from "./types.js";
+import { MEMORY_TYPES, visibleTo } from "./types.js";
 
 /**
  * Above this cosine, two memories are *candidates* for being the same fact.
@@ -51,19 +45,8 @@ const DEDUP_THRESHOLD = 0.92;
  * low costs a duplicate, which is the cheap direction.
  */
 const DEDUP_MIN_WORD_OVERLAP = 0.5;
-/** Candidates pulled per recall before re-ranking. One QueryVectors page. */
+/** Candidates pulled per recall before application ranking. */
 const CANDIDATE_CAP = 100;
-/** Index keys fetched per listing round trip. S3's own maximum. */
-const PAGE_SIZE = 1000;
-/**
- * Index keys `memory_stats` will scan before it stops.
- *
- * Counting by type means listing every key, so there has to be a stopping
- * point. Past it the totals are a floor rather than a count, and the answer
- * says so — a truncated number presented as exact is a wrong answer the caller
- * has no way to notice.
- */
-export const STATS_SCAN_CAP = 10_000;
 
 export interface RecallRequest {
   query: string;
@@ -96,75 +79,12 @@ export interface StatsRequest {
   conversation?: string;
 }
 
-/**
- * The visibility rule, in one place: a project memory is everyone's, a
- * conversation memory is its own conversation's and nobody else's — a request
- * in no conversation included. Recall, dedup and listing all read it, so the
- * three cannot disagree about whose note a thread gets to see.
- */
-export function visibleTo(
-  memory: Pick<StoredMemory, "scope" | "conversation">,
-  conversation: string | undefined,
-): boolean {
-  return memory.scope !== "conversation" || (!!conversation && memory.conversation === conversation);
-}
-
 export interface MemoryService {
   recall(tenant: string, request: RecallRequest): Promise<string>;
   remember(tenant: string, request: RememberRequest): Promise<string>;
   list(tenant: string, request: ListRequest): Promise<string>;
   forget(tenant: string, id: string): Promise<string>;
   stats(tenant: string, request: StatsRequest): Promise<string>;
-}
-
-/**
- * The recency index: one empty object per memory, keyed so that S3's ascending
- * listing reads newest-first.
- *
- * It exists because S3 Vectors answers "what is nearest to this vector" and
- * nothing else — there is no way to ask it for the most recent memories, or to
- * count them by type. The key carries everything those two questions need, so
- * both are answered by listing keys without fetching a single body.
- */
-function indexKey(
-  tenant: string,
-  memory: Pick<StoredMemory, "id" | "memoryType" | "scope" | "conversation">,
-): string {
-  const base = `index/${tenant}/${invertedTime(ulidTime(memory.id))}#${memory.id}#${memory.memoryType}`;
-  // A conversation memory carries its conversation on the key — as a digest,
-  // since the value may hold the very characters this key splits on — so a
-  // listing can keep other threads' notes out without fetching a body to find
-  // out. A project memory's key is exactly what it always was.
-  return memory.scope === "conversation" && memory.conversation
-    ? `${base}#${conversationKeyPart(memory.conversation)}`
-    : base;
-}
-
-interface IndexEntry {
-  id: string;
-  memoryType: string;
-  /** The conversation digest a scoped memory's key carries; absent for a project memory. */
-  conversationKey?: string;
-}
-
-function parseIndexKey(key: string): IndexEntry | undefined {
-  const parts = key.slice(key.lastIndexOf("/") + 1).split("#");
-  if ((parts.length !== 3 && parts.length !== 4) || !parts[1] || !parts[2]) {
-    return undefined;
-  }
-  return {
-    id: parts[1],
-    memoryType: parts[2],
-    ...(parts.length === 4 && parts[3] ? { conversationKey: parts[3] } : {}),
-  };
-}
-
-/** Whether an index entry's memory may be listed to this conversation — the key-level half of {@link visibleTo}. */
-function entryVisibleTo(entry: IndexEntry, conversation: string | undefined): boolean {
-  return (
-    entry.conversationKey === undefined ||
-    (!!conversation && entry.conversationKey === conversationKeyPart(conversation))
-  );
 }
 
 function percent(value: number): string {
@@ -216,13 +136,13 @@ function day(iso: string): string {
 /**
  * The closest of a set of hits, or `undefined` when there are none.
  *
- * `VectorStore.query` returns the nearest neighbours in no promised order, so
+ * `MemoryStore.query` returns the nearest neighbours in no promised order, so
  * every caller that needs the best one has to find it. `recall` does the same
  * thing with `Math.max` over the similarities; this is the version that has to
  * carry the hit itself.
  */
-function nearestOf(hits: readonly VectorHit[]): VectorHit | undefined {
-  let best: VectorHit | undefined;
+function nearestOf(hits: readonly MemoryHit[]): MemoryHit | undefined {
+  let best: MemoryHit | undefined;
   for (const hit of hits) {
     if (!best || hit.similarity > best.similarity) {
       best = hit;
@@ -254,11 +174,9 @@ function render(memory: StoredMemory, position: number, standing?: number): stri
   return `${position}. [id:${memory.id}] (${facets.join(", ")})\n   ${memory.content}${tags}`;
 }
 
-export class S3MemoryService implements MemoryService {
+export class MemoryManager implements MemoryService {
   constructor(
-    private readonly vectors: VectorStore,
-    private readonly objects: ObjectStore,
-    private readonly stats_: StatsTracker,
+    private readonly store: MemoryStore,
     private readonly embedder: Embedder,
     /** The absolute relevance floor. Model-specific — see `RECALL_MIN_SIMILARITY`. */
     private readonly minSimilarity: number,
@@ -271,12 +189,15 @@ export class S3MemoryService implements MemoryService {
     const limit = request.limit ?? config.limit;
 
     const embedding = await this.embedder.embed(request.query);
-    // Visibility is applied here, after the store answered and before anything
-    // is ranked or rendered — the store's filter stays the one tenant key it has
-    // always been, and another thread's note never reaches the model, not even
-    // as a gated-out count. Nothing here may widen the store's own filter.
+    // PostgreSQL applies visibility before LIMIT. This second check keeps the
+    // application seam fail-closed if an adapter ever violates that contract.
     const hits = (
-      await this.vectors.query(tenant, embedding, Math.min(CANDIDATE_CAP, Math.max(30, limit * 3)))
+      await this.store.query(
+        tenant,
+        embedding,
+        Math.min(CANDIDATE_CAP, Math.max(30, limit * 3)),
+        request.conversation,
+      )
     ).filter((hit) => visibleTo(hit.memory, request.conversation));
 
     if (hits.length === 0) {
@@ -310,16 +231,12 @@ export class S3MemoryService implements MemoryService {
     );
     const gated = hits.length - keeping.length;
 
-    const counters = await this.stats_.load(tenant);
     const at = this.now();
-    const maxAccess = Math.max(
-      ...keeping.map((hit) => StatsTracker.statsFor(counters, hit.memory.id).accessCount),
-      0,
-    );
+    const maxAccess = Math.max(...keeping.map((hit) => hit.stats.accessCount), 0);
 
     const ranked: RankedMemory[] = [];
     for (const hit of keeping) {
-      const stats = StatsTracker.statsFor(counters, hit.memory.id);
+      const stats = hit.stats;
       // Decay runs from the last time the memory was touched, falling back to
       // when it was written — a memory nobody has used since is as old as it looks.
       const lastActivity = stats.lastAccessedAt
@@ -352,11 +269,11 @@ export class S3MemoryService implements MemoryService {
     const results = ranked.slice(0, limit);
     const confidence = confidenceOf(results[0]?.similarity, this.minSimilarity);
 
-    // In memory only — the counter layer flushes on its own schedule, so
-    // nothing here writes to S3 on the read path.
-    for (const memory of results) {
-      this.stats_.record(tenant, memory.id, at);
-    }
+    await this.store.touch(
+      tenant,
+      results.map((memory) => memory.id),
+      new Date(at).toISOString(),
+    );
 
     if (results.length === 0) {
       return [
@@ -396,13 +313,13 @@ export class S3MemoryService implements MemoryService {
     // handful of neighbours rather than one, since the closest may be someone
     // else's.
     //
-    // Found rather than taken: `VectorStore.query` promises the nearest
+    // Found rather than taken: `MemoryStore.query` promises the nearest
     // neighbours and says nothing about the order they arrive in, and this is
     // the one place a wrong pick is silent — dedup compares against whichever
     // hit came first, so under a store that does not sort, a near-verbatim
     // repeat lands beside its twin instead of merging.
     const nearest = nearestOf(
-      (await this.vectors.query(tenant, embedding, 5)).filter((hit) =>
+      (await this.store.query(tenant, embedding, 5, request.conversation)).filter((hit) =>
         visibleTo(hit.memory, request.conversation),
       ),
     );
@@ -411,7 +328,7 @@ export class S3MemoryService implements MemoryService {
       nearest.similarity >= DEDUP_THRESHOLD &&
       wordOverlap(request.content, nearest.memory.content) >= DEDUP_MIN_WORD_OVERLAP
     ) {
-      this.stats_.record(tenant, nearest.memory.id, this.now());
+      await this.store.touch(tenant, [nearest.memory.id], new Date(this.now()).toISOString());
       // No percentage: the number that decided this is a cosine, and what a
       // cosine means belongs to the embedding model rather than to the memory.
       // That it was close enough to count as the same fact is the whole of what
@@ -438,146 +355,51 @@ export class S3MemoryService implements MemoryService {
       trustBase: TRUST_MANUAL,
     };
 
-    await this.vectors.put(memory, embedding);
-    // After the vector, never before: an index entry with no memory behind it
-    // would show up in listings as a memory that cannot be read. The reverse —
-    // a memory missing from the index — still answers every recall, and only
-    // costs it a place in `list_memories`.
-    await this.objects.put(indexKey(tenant, memory), "");
+    await this.store.put(memory, embedding);
 
     return `[MEMORY] Stored as ${memory.id}.\n\n${render(memory, 1)}`;
   }
 
   async list(tenant: string, request: ListRequest): Promise<string> {
-    const entries = await this.recentEntries(tenant, request);
+    const memories = (
+      await this.store.list(tenant, {
+        memoryType: request.memoryType,
+        conversation: request.conversation,
+        limit: request.limit,
+      })
+    ).filter((memory) => visibleTo(memory, request.conversation));
 
-    if (entries.length === 0) {
+    if (memories.length === 0) {
       const scope = request.memoryType ? ` of type "${request.memoryType}"` : "";
       return `[MEMORY] This project has no memories${scope} yet.`;
     }
 
-    const found = await this.vectors.get(
-      tenant,
-      entries.map((entry) => entry.id),
-    );
-    // Restore the newest-first order the keys carried; `get` says nothing about order.
-    const byId = new Map(found.map((memory) => [memory.id, memory]));
-    const ordered = entries
-      .map((entry) => byId.get(entry.id))
-      // The key already kept other threads' notes out; the body is checked
-      // again because it is the record and the key is a listing artefact.
-      .filter(
-        (memory): memory is StoredMemory =>
-          memory !== undefined && visibleTo(memory, request.conversation),
-      );
-
     return [
-      `[MEMORY] ${ordered.length} ${ordered.length === 1 ? "memory" : "memories"}, newest first.`,
+      `[MEMORY] ${memories.length} ${memories.length === 1 ? "memory" : "memories"}, newest first.`,
       "",
-      ...ordered.map((memory, i) => render(memory, i + 1)),
+      ...memories.map((memory, i) => render(memory, i + 1)),
     ].join("\n");
   }
 
-  /**
-   * The newest `limit` index entries, optionally of one type.
-   *
-   * Keys are ordered newest-first by construction, so the first page is already
-   * the answer when nothing is filtered. A type filter is the awkward case: the
-   * type sits at the end of the key, so it cannot narrow the prefix, and taking
-   * one page and filtering it would quietly return fewer than asked for on a
-   * project whose recent memories are mostly of other types. So it pages until
-   * it has enough or the prefix runs out.
-   */
-  private async recentEntries(tenant: string, request: ListRequest): Promise<IndexEntry[]> {
-    const prefix = `index/${tenant}/`;
-    const found: IndexEntry[] = [];
-    let after: string | undefined;
-    // Only a request in no conversation, asking for no type, can take the first
-    // `limit` keys as the answer: a type filter and another thread's scoped
-    // notes both sit at the end of the key, so either may thin a page.
-    const pageSize = request.memoryType || request.conversation ? PAGE_SIZE : request.limit;
-
-    while (found.length < request.limit) {
-      const page = await this.objects.list(prefix, pageSize, after);
-      if (page.length === 0) {
-        break;
-      }
-      for (const key of page) {
-        const entry = parseIndexKey(key);
-        if (
-          entry &&
-          entryVisibleTo(entry, request.conversation) &&
-          (!request.memoryType || entry.memoryType === request.memoryType)
-        ) {
-          found.push(entry);
-          if (found.length === request.limit) {
-            break;
-          }
-        }
-      }
-      if (page.length < pageSize) {
-        break;
-      }
-      after = page[page.length - 1];
-    }
-    return found;
-  }
-
   async forget(tenant: string, id: string): Promise<string> {
-    const [existing] = await this.vectors.get(tenant, [id]);
+    const [existing] = await this.store.get(tenant, [id]);
     if (!existing) {
       return `[MEMORY] No memory with id ${id} exists for this project. Nothing was deleted.`;
     }
-    // The vector first, and the order is not arbitrary. Losing the vector is
-    // what makes the memory unreachable, which is what was asked for; the index
-    // entry is a listing artefact. Reversed, a failure would leave a memory the
-    // caller was told about as deleted still answering every recall.
-    await this.vectors.delete(tenant, [id]);
-    // So the index entry is garbage collection, not correctness — and a failure
-    // here must not be reported as a failed deletion, because the deletion
-    // happened. What it leaves behind is a key that resolves to nothing:
-    // `list_memories` already drops those, and `memory_stats` counts one too
-    // many until someone removes it.
-    await this.objects.delete([indexKey(tenant, existing)]).catch((error: unknown) => {
-      logError("forget_index_cleanup_failed", error, { tenant, key: indexKey(tenant, existing) });
-    });
-    // Counters for the deleted id are left behind. They are a few bytes inside
-    // an object nothing will ever look up again, and removing them would mean a
-    // compare-and-swap on the merged counters for no behavioural gain.
+    await this.store.delete(tenant, [id]);
     return `[MEMORY] Deleted ${id}.`;
   }
 
   async stats(tenant: string, request: StatsRequest = {}): Promise<string> {
-    const keys = await this.objects.list(`index/${tenant}/`, STATS_SCAN_CAP);
-    const counts = new Map<string, number>();
-    for (const key of keys) {
-      const entry = parseIndexKey(key);
-      // Counted the way it would be recalled and listed. A total that included
-      // other threads' notes would contradict the two tools that can actually
-      // show them: a model told there are forty memories, offered twenty-two
-      // by `list_memories` and given no way to reconcile the difference, has
-      // been handed a number about memories it may not see.
-      if (entry && entryVisibleTo(entry, request.conversation)) {
-        counts.set(entry.memoryType, (counts.get(entry.memoryType) ?? 0) + 1);
-      }
-    }
-    const total = [...counts.values()].reduce((a, b) => a + b, 0);
+    const counts = await this.store.count(tenant, request.conversation);
+    const total = Object.values(counts).reduce((sum, count) => sum + (count ?? 0), 0);
     if (total === 0) {
       return "[MEMORY] This project has no memories yet.";
     }
-    const breakdown = MEMORY_TYPES.filter((type) => counts.has(type))
-      .map((type) => `${type}: ${counts.get(type)}`)
+    const breakdown = MEMORY_TYPES.filter((type) => counts[type] !== undefined)
+      .map((type) => `${type}: ${counts[type]}`)
       .join(", ");
     const noun = total === 1 ? "memory" : "memories";
-    // Against the keys scanned, not the memories counted: what the cap
-    // truncated is the listing, and a total thinned by another thread's notes
-    // is a lower bound just the same.
-    if (keys.length >= STATS_SCAN_CAP) {
-      return (
-        `[MEMORY] At least ${total} ${noun} for this project (${breakdown}). ` +
-        `Counting stopped at ${STATS_SCAN_CAP} keys, so every figure here is a lower bound.`
-      );
-    }
     return `[MEMORY] ${total} ${noun} for this project (${breakdown}).`;
   }
 }
