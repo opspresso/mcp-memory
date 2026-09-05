@@ -16,12 +16,12 @@ COPY --from=build /app/dist ./dist
 EXPOSE 3000
 # The image ships with an unprivileged `node` user and nothing here needs more
 # than that: the server binds 3000, reads its config from the environment, and
-# writes only to S3. Everything above is owned by root and stays read-only to
-# this user, which is the point — a process that cannot rewrite its own code is
-# one less thing an RCE buys.
+# reaches PostgreSQL over the network. Everything above is owned by root and
+# stays read-only to this user, which is the point — a process that cannot
+# rewrite its own code is one less thing an RCE buys.
 USER node
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
   CMD ["node", "-e", "fetch('http://127.0.0.1:'+(process.env.PORT||3000)+'/health').then(r=>process.exit(r.ok?0:1),()=>process.exit(1))"]
 # exec form: node is PID 1 so SIGTERM reaches it on a rolling deploy, which is
-# what lets the counter flush in `main.ts` run before the process goes away.
+# what lets `main.ts` close the connection pool before the process goes away.
 CMD ["node", "dist/main.js"]

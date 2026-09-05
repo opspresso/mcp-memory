@@ -1,0 +1,22 @@
+name: mcp-memory-local
+
+services:
+  postgres:
+    image: pgvector/pgvector:0.8.6-pg18-trixie
+    environment:
+      POSTGRES_DB: mcp_memory
+      POSTGRES_USER: mcp_memory
+      POSTGRES_PASSWORD: mcp_memory
+    ports:
+      - "127.0.0.1:5434:5432"
+    volumes:
+      - postgres18-data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mcp_memory -d mcp_memory"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+volumes:
+  postgres18-data:

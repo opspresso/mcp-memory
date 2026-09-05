@@ -16,7 +16,7 @@
  * channel is wrong.
  *
  * A request with no tenant is refused rather than defaulted. A default here
- * would be a shared bucket that every misconfigured binding silently falls
+ * would be a shared tenant that every misconfigured binding silently falls
  * into, which is the same leak arriving by accident instead of by attack.
  */
 
@@ -28,17 +28,16 @@ export const TENANT_HEADER = "x-memory-tenant";
  * project's name — which is what makes this server per-project there with no
  * per-project registration at all — and the name is deliberately unbranded, so
  * any client with the same convention scopes the same way. Explicit wins: an
- * operator who set `x-memory-tenant` by hand has said which bucket this
+ * operator who set `x-memory-tenant` by hand has said which tenant this
  * binding is, and the automatic name must not override that.
  */
 export const TENANT_ID_HEADER = "x-tenant-id";
 
-/** Long enough for a repository-style name, short enough to keep S3 keys sane. */
+/** Long enough for a repository-style name and bounded for indexed storage. */
 const MAX_LENGTH = 128;
 /**
- * Conservative on purpose. The value lands in two places with different rules —
- * an S3 key path and an S3 Vectors filter value — so it is restricted to what
- * is unambiguous in both rather than to what either would tolerate alone.
+ * Conservative on purpose. The value becomes a security-sensitive PostgreSQL
+ * filter, so it is restricted to an unambiguous identifier shape.
  */
 const ALLOWED = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 
@@ -78,8 +77,7 @@ export function parseTenant(
       `${header} must start with a letter or digit and contain only letters, digits, '.', '_' or '-'`,
     );
   }
-  // `.` and `..` pass the pattern and mean something to a path. Nothing else
-  // does: the pattern already bars '/', so no other traversal spelling exists.
+  // `.` and `..` carry no tenant identity despite passing the character rule.
   if (value === "." || value === "..") {
     throw new TenantError(`${header} is not a valid tenant`);
   }

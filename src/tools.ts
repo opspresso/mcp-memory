@@ -1,8 +1,5 @@
 /**
- * The five memory tools, the optional docs tool, their schemas, and the
- * dispatch from a JSON-RPC name to the service that does the work.
- * `search_docs` only exists in a catalogue when a knowledge base is configured
- * — see `toolCatalogue`.
+ * The five memory tools, their schemas, and dispatch.
  *
  * Descriptions are load-bearing. They are the whole of what the model knows
  * about this server, and the one about `recall` has a job beyond describing
@@ -14,7 +11,6 @@
  * and not an omission.
  */
 
-import { renderDocs, type DocsRetriever } from "./docs.js";
 import { elapsedMs, logError, logInfo } from "./log.js";
 import type { RequestContext } from "./mcp.js";
 import {
@@ -26,8 +22,8 @@ import {
   type MemoryScope,
   type MemoryType,
 } from "./types.js";
-import { MAX_CONTENT_BYTES, VectorStoreError } from "./store/vectors.js";
-import { STATS_SCAN_CAP, type MemoryService } from "./service.js";
+import { MAX_CONTENT_BYTES, MemoryStoreError } from "./store/memoryStore.js";
+import type { MemoryService } from "./service.js";
 
 export interface ToolDefinition {
   name: string;
@@ -45,11 +41,7 @@ export const MAX_TAGS = 20;
 /**
  * Byte ceilings for the two labels a model supplies alongside the body.
  *
- * Both are labels, so these are generous — but they are not decoration. The
- * category shares a 2 KB filterable budget it can exhaust on its own, and the
- * tags share a 40 KB one with a body that may be 32 KB. Bounded here so the
- * model is told which field to shorten, rather than in the store alone, where
- * the answer arrives as a size it cannot attribute to anything it sent.
+ * Both are labels, so these are generous but deliberately bounded.
  */
 export const MAX_CATEGORY_BYTES = 128;
 export const MAX_TAG_BYTES = 64;
@@ -167,48 +159,10 @@ export const TOOLS: readonly ToolDefinition[] = [
     description:
       "How many memories this project has, broken down by type. Counts the same memories " +
       "recall and list_memories can show you — the project's, plus this conversation's own — " +
-      `and never another conversation's. Exact up to ${STATS_SCAN_CAP} memories; past that ` +
-      "the answer says so and reports a lower bound.",
+      "and never another conversation's.",
     inputSchema: { type: "object", properties: {} },
   },
 ];
-
-/** The Retrieve API's own ceiling on a query, in characters. */
-export const MAX_QUERY_CHARS = 1000;
-/** The knowledge base's own default result count. */
-const DEFAULT_DOCS_LIMIT = 5;
-
-/**
- * Not part of `TOOLS`: the memory tools exist everywhere, this one only where a
- * knowledge base is configured. `toolCatalogue` is the one place they combine.
- */
-export const SEARCH_DOCS_TOOL: ToolDefinition = {
-  name: "search_docs",
-  description:
-    "Search the shared documentation library by meaning and return the most relevant " +
-    "excerpts, each with the source document it came from. Use it when this project's own " +
-    "memories (recall) do not answer — how-tos, policies, reference material. Results are " +
-    "excerpts, not whole documents. An empty result means nothing close is indexed, which " +
-    "is not the same as the subject having no answer.",
-  inputSchema: {
-    type: "object",
-    properties: {
-      query: {
-        type: "string",
-        description: `What you want to find, in natural language (max ${MAX_QUERY_CHARS} characters).`,
-      },
-      limit: {
-        type: "integer",
-        description: `Maximum excerpts to return (1-${MAX_LIMIT}). Default ${DEFAULT_DOCS_LIMIT}.`,
-      },
-    },
-    required: ["query"],
-  },
-};
-
-export function toolCatalogue(withDocs: boolean): readonly ToolDefinition[] {
-  return withDocs ? [...TOOLS, SEARCH_DOCS_TOOL] : TOOLS;
-}
 
 class ArgumentError extends Error {}
 
@@ -301,10 +255,9 @@ export async function callTool(
   context: RequestContext,
   name: string,
   args: Record<string, unknown>,
-  docs?: DocsRetriever,
 ): Promise<ToolResult> {
   const started = performance.now();
-  const result = await dispatch(service, context, name, args, docs);
+  const result = await dispatch(service, context, name, args);
   // Whether the request was in a conversation, never which: the value is a
   // thread address the caller owns, and `log.ts` keeps those out.
   logInfo("tool_call", {
@@ -322,7 +275,6 @@ async function dispatch(
   { tenant, conversation }: RequestContext,
   name: string,
   args: Record<string, unknown>,
-  docs?: DocsRetriever,
 ): Promise<ToolResult> {
   try {
     switch (name) {
@@ -342,10 +294,8 @@ async function dispatch(
       }
       case "remember": {
         const content = requireString(args, "content");
-        // Bytes, because that is what the metadata budget is measured in and
-        // the two differ by 3x for non-ASCII. Checked here as well as in the
-        // store so the model gets an actionable message rather than a rejection
-        // from AWS it cannot interpret.
+        // Bytes because the two differ by 3x for non-ASCII. Checked here as
+        // well as in the store so the model gets an actionable message.
         const bytes = Buffer.byteLength(content, "utf8");
         if (bytes > MAX_CONTENT_BYTES) {
           throw new ArgumentError(
@@ -398,30 +348,6 @@ async function dispatch(
         return text(await service.forget(tenant, requireString(args, "id")));
       case "memory_stats":
         return text(await service.stats(tenant, { conversation }));
-      case "search_docs": {
-        // Without a knowledge base the tool is absent from the catalogue and
-        // the server rejects the name before it gets here — but the dispatch
-        // must not depend on that.
-        if (!docs) {
-          return failure(`Error: unknown tool "search_docs".`);
-        }
-        const query = requireString(args, "query");
-        // Characters, not bytes: that is how the Retrieve API measures it.
-        if (query.length > MAX_QUERY_CHARS) {
-          throw new ArgumentError(
-            `\`query\` is ${query.length} characters; the maximum is ${MAX_QUERY_CHARS}. ` +
-              "Ask for the one thing you want to find.",
-          );
-        }
-        // The tenant is deliberately not part of the search: the documentation
-        // library is shared across tenants, unlike the memories. It still lands
-        // in the error log context below.
-        return text(
-          await docs
-            .retrieve(query, optionalLimit(args, DEFAULT_DOCS_LIMIT) ?? DEFAULT_DOCS_LIMIT)
-            .then((results) => renderDocs(query, results)),
-        );
-      }
       default:
         return failure(`Error: unknown tool "${name}".`);
     }
@@ -429,16 +355,9 @@ async function dispatch(
     // Both are the model's mistake, and it can see the message, so nothing
     // goes to the log — there is nothing for an operator to act on.
     //
-    // `VectorStoreError` is one of these despite arriving from the store: it
-    // is the metadata budget refusing what the *model* sent, and the checks
-    // above cannot catch all of it. Content and category are bounded on their
-    // own; what they cannot see is the sum — twenty tags beside a 32 KB body
-    // against a 40 KB ceiling, a category beside a long conversation id
-    // against the filterable half's 2 KB. Reported as a dependency failure it
-    // woke somebody for a sentence only the model could act on, and buried
-    // the actionable half in "the memory store could not complete this
-    // request".
-    if (error instanceof ArgumentError || error instanceof VectorStoreError) {
+    // `MemoryStoreError` is one of these despite arriving from the store: it
+    // refuses input the model can shorten, not a dependency failure.
+    if (error instanceof ArgumentError || error instanceof MemoryStoreError) {
       return failure(`Error: ${error.message}`);
     }
     // Everything else is a dependency failing. The model gets a sentence and
@@ -446,10 +365,6 @@ async function dispatch(
     // it — so it is said out loud here as well.
     logError("tool_failed", error, { tenant, tool: name });
     const message = error instanceof Error ? error.message : String(error);
-    return failure(
-      name === "search_docs"
-        ? `Error: the documentation index could not be searched — ${message}`
-        : `Error: the memory store could not complete this request — ${message}`,
-    );
+    return failure(`Error: the memory store could not complete this request — ${message}`);
   }
 }

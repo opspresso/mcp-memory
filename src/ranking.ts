@@ -14,9 +14,8 @@
  * Two signals this deliberately does not carry. **Helpfulness** — whether a
  * recalled memory actually got used — would need the client to call back and
  * say so, and Agent Studio has no way to. **Keyword matching**, to catch a
- * query naming something the embedding does not associate, would need a
- * full-text index that S3 has no equivalent for. Both are absences forced by
- * the environment rather than judgements about their worth; see the README.
+ * query naming something the embedding does not associate, is deliberately
+ * outside this memory-only semantic search surface.
  */
 
 import type { MemoryType, RecallMode } from "./types.js";

@@ -1,556 +1,179 @@
 # mcp-memory
 
-An MCP server that gives an Agent Studio project a memory that outlives a run.
-
-| Tool | Takes | Returns |
-|---|---|---|
-| `recall(query, limit?, mode?)` | a question in natural language | matching memories, ranked, with a confidence level |
-| `remember(content, type?, category?, tags?, scope?)` | a fact worth keeping — for the project, or with `scope: "conversation"` for this conversation alone | the id it was stored under, or the existing one that already said it |
-| `list_memories(type?, limit?)` | — | this project's memories, newest first |
-| `forget(id)` | an id from `recall` | confirmation, or that no such memory exists |
-| `memory_stats()` | — | how many memories this conversation can see, by type; a lower bound past 10,000 |
-| `search_docs(query, limit?)` | a question in natural language | matching documentation excerpts with their sources — offered only when `KNOWLEDGE_BASE_ID` is set |
-
-It exists because every run starts from nothing. An agent that decided something
-last week, or was told a convention, or worked out which command actually works,
-has no way to know it now — so the user explains it again, or the agent guesses.
-
-## Storage is S3 — or PostgreSQL
-
-Two buckets and no database, or one database and no AWS. The S3 pair is the
-original and is described here; the [PostgreSQL backend](#postgresql) below
-stands in for both buckets behind the same two interfaces, and everything
-above them — ranking, dedup, tenancy, the counters — is the same code.
-
-**S3 Vectors** holds the memories. The body rides in the vector's own metadata,
-so `recall` is one `QueryVectors` call — the text comes back with the distance,
-and there is no second lookup to make.
-
-**Ordinary S3** holds what changes: access counters, and one empty object per
-memory whose key encodes the time so that listing it gives newest-first order.
-
-A memory is written once and never updated. That is the load-bearing decision:
-updating one would mean rewriting its vector, and two pods rewriting the same
-vector is a lost update with no way to notice. Everything mutable was moved out
-from under that constraint instead.
-
-### Counters without a lock
-
-S3 has no atomic increment, so nothing here modifies a shared object in place.
-A pod accumulates counts in memory and periodically writes a **delta** to a key
-only it will ever write. A reader sums `merged.json` and every shard above its
-watermark — counts add, timestamps take the later — which converges regardless
-of arrival order. When shards pile up, whichever request notices folds them in
-with a compare-and-swap and advances the watermark.
-
-The watermark is what makes that safe: a shard is never counted twice, even if
-the pod that folded it died before deleting it, and even if two pods compact at
-once. Deleting absorbed shards is garbage collection, not correctness.
-
-It also trails by a minute, which is what stops a shard being counted *zero*
-times. A key is stamped when the flush builds it rather than when S3 accepts
-it, so a line drawn across everything currently visible can land above a write
-still in flight — and a pod whose clock runs behind mints low keys every time,
-turning that race into a pattern. Only shards older than the lag are absorbed,
-so any write that lands within a minute of being stamped is still counted.
-
-```
-s3://<VECTOR_BUCKET>/                      (S3 Vectors)
-  index "memories"                          key: <tenant>#<ulid>
-                                            filterable:     tenantId, memoryType, category,
-                                                            scope (only "conversation"), conversation
-                                            non-filterable: content, createdAt, tags, trustBase
-
-s3://<STATE_BUCKET>/
-  index/<tenant>/<invertedTime>#<ulid>#<type>[#<conversationDigest>]
-                                                 empty; the key is the whole record —
-                                                 the digest only on a conversation-scoped memory
-  stats/<tenant>/shard/<ulid>-<podId>.json      one pod-flush of counter deltas
-  stats/<tenant>/merged.json                    folded counters + watermark
-```
-
-### PostgreSQL
-
-Set `DATABASE_URL` and nothing else about storage: the buckets are not
-required, the AWS SDKs are never loaded, and the process needs no credentials
-beyond the URL. It is the backend for a deployment with no AWS at all — an
-on-premises Agent Studio — and it is selected by presence, so a `DATABASE_URL`
-beside a pair of buckets means PostgreSQL.
-
-```
-DATABASE_URL=postgres://memory:…@postgres:5432/memory
-EMBEDDING_PROVIDER=openai EMBEDDING_BASE_URL=… EMBEDDING_API_KEY=…
-```
-
-The second line is not optional in practice. Bedrock is still the default
-embedder, and a deployment that chose PostgreSQL to avoid AWS will want an
-OpenAI-compatible endpoint for the same reason — an in-house model server, or
-a provider. `search_docs` stays a Bedrock Knowledge Base and stays optional;
-without `KNOWLEDGE_BASE_ID` it is not offered, as before.
-
-The schema is the process's own. The first pod to start creates what is
-missing — under an advisory lock, so several starting together do not race
-each other on the same `CREATE` — and a later boot finds it there:
-
-```sql
-CREATE EXTENSION IF NOT EXISTS vector;
-
-CREATE TABLE memories (            -- one row per memory; what S3 Vectors held
-  tenant_id text NOT NULL,
-  id        text NOT NULL,
-  embedding vector NOT NULL,       -- no width: it is the embedding model's
-  metadata  jsonb NOT NULL,        -- exactly the metadata the S3 store writes
-  PRIMARY KEY (tenant_id, id)
-);
-
-CREATE SEQUENCE objects_version;
-CREATE TABLE objects (             -- one row per key; what ordinary S3 held
-  key        text COLLATE "C" PRIMARY KEY,
-  body       text NOT NULL,
-  version    bigint NOT NULL,      -- the ETag: a compare-and-swap names it
-  updated_at timestamptz NOT NULL DEFAULT now()
-);
-```
-
-Three things in it are deliberate. **The vector column has no width**, so the
-dimension is whatever `EMBEDDING_DIM` says and a model swap needs no migration
-— though the memories already written are at the old width, and pgvector
-refuses to compare two widths, so a swap still means re-embedding or starting
-a fresh database. **There is no vector index.** A recall is an exact scan over
-one tenant's rows, ordered by cosine distance (`<=>`), and similarity is
-`1 − distance` — the same number S3 Vectors reports, so `RECALL_MIN_SIMILARITY`
-means the same under either backend. An approximate index can miss the
-nearest neighbour, which is precisely the one dedup asks for, and a project
-holds thousands of memories rather than millions. **The key column is
-collated `"C"`**: the recency index sorts newest-first only in byte order,
-which is what S3 lists in and what a locale collation does not.
-
-`CREATE EXTENSION vector` needs a superuser unless the build marks pgvector
-trusted. If the role the server runs as cannot create it, the boot says so and
-names the statement to run; the `pgvector/pgvector` image ships the extension,
-and creating it once by hand is all that is needed.
-
-Nothing else changes. Counters are still per-pod shards folded in with a
-compare-and-swap — PostgreSQL could count atomically, but the design that
-needs no lock is the one tested, and it runs unchanged on a row version. The
-S3 path is exactly what it was: same code, same buckets, same index.
-
-## Which memories a caller gets
-
-**The tenant comes from a header and never from a tool argument** — an explicit
-`X-Memory-Tenant`, or the `X-Tenant-Id` header Agent Studio stamps on
-every MCP request when no explicit one is configured (explicit wins). Agent Studio stores per-server headers encrypted and merges a
-version's overrides in at dispatch, so the header is something an operator
-configured. A tool argument is something the *model* chose — and a model that
-can name its own tenant can read another project's memories by asking, including
-a model that was talked into it by text it retrieved a moment earlier. No amount
-of validation fixes that; the channel is wrong.
-
-The handshake and `tools/list` do not need a tenant: they describe the server,
-not anyone's memories. The tenant is resolved when a tool runs, and a call with
-neither header is refused rather than defaulted. A refusal names the header the
-value actually came on, and a blank explicit header gives way to the stamped one
-rather than masking it — a registry entry that carries an override it has no
-value for is an accident, not a choice of tenant.
-
-The value itself is held to at most 128 characters, starting with a letter or a
-digit and otherwise carrying only letters, digits, `.`, `_` and `-`. It lands in
-an S3 key path and in an S3 Vectors filter value, so what it may hold is the
-intersection of the two rather than what either would tolerate alone. A header
-sent twice is refused as well: which of the values was meant is not something to
-guess at when guessing wrong picks another project's memories.
-
-### And which conversation is asking
-
-A second header rides beside the tenant when the caller is in a conversation:
-`X-Conversation-Id`, which Agent Studio stamps on every MCP request a run makes
-from a chat (`chat:{id}`), a Slack thread (`slack:{channel}:{thread}`), an
-inbound A2A call (`a2a:{client}:{contextId}`) or an API caller that declared
-one (`api:{caller}:{id}`). Same rules for the same reason: from a header, never
-from a tool argument, so a model cannot name a conversation it is not in.
-
-What it changes:
-
-- **`remember` takes a `scope`.** `project` (the default, and what every memory
-  written before scopes existed is) is shared by every conversation of the
-  tenant. `conversation` is this conversation's alone — a preference stated in
-  one thread, a working note — and is recalled, listed and de-duplicated only
-  where the same `X-Conversation-Id` asks. Asking for it on a request that is in
-  no conversation is refused by name, never silently filed under the project.
-- **A project memory written from a conversation records which one**, as
-  provenance. Its visibility is not narrowed.
-- **`recall`, `list_memories` and `memory_stats` answer with the project's
-  memories plus this conversation's own.** Another conversation's scoped notes
-  never reach the model — not in the results, not in the "gated out" count, not
-  in the totals, and not as the "already known" answer to a `remember`. The
-  store's own filter stays the one tenant key it has always been; visibility is
-  applied on the way out.
-
-The header is optional. A request without one — a probe, a **Test connection**,
-a webhook firing, an API call that declared no conversation — reads and writes
-project memories exactly as before, and simply cannot see or write
-conversation-scoped ones. A malformed one (whitespace, non-ASCII, over 512
-characters, sent twice) is refused rather than read as "no conversation".
-
-Two things the key deliberately is not. It is not a *person*: the same thread
-may hold several people, and a note kept for it is kept for the thread. And it
-is not a ranking signal: a project memory recalled from the conversation that
-stored it scores exactly as it does anywhere else — provenance is recorded,
-never weighed.
-
-## What it does not do
-
-Worth knowing before you rely on it:
-
-- **Nothing is injected by this server before a run.** A memory server would
-  ideally put what it knows into the model's context *before* the first token,
-  with no tool call to pay for — which is what MCP *resources* are for, and
-  Agent Studio reads `tools/list` and `tools/call` and nothing else. What
-  exists instead lives on the platform's side: a version that opts into
-  `memoryRecall` has the *run* call `recall` with the newest user turn before
-  the first token and put the answer in the system prompt. From here that is an
-  ordinary `recall` — one call per run, with the run's tenant and conversation
-  on it — and the `recall` description still asks the model to call it early
-  for the versions that did not opt in.
-- **Counters are approximate.** A pod that dies before its next flush takes up
-  to `STATS_FLUSH_MS` of counts with it, and a pod re-reads the durable counts
-  only once a minute, so another pod's flush reaches this one's ranking that
-  much later — its own reads are counted immediately either way. They feed
-  ranking and nothing else.
-- **No automatic expiry.** S3 Vectors has no lifecycle rules, and nothing is
-  scheduled against the PostgreSQL tables either, so nothing ages out on its
-  own. `forget` is the only removal.
-- **No keyword matching.** A query naming something the embedding does not
-  associate — a library name, an error code — will not find it by that name
-  alone. Catching those needs a full-text index, which S3 has no equivalent for
-  and which the PostgreSQL backend does not build.
-- **A busy thread can crowd a recall.** The store is asked for the nearest
-  hundred within the tenant and visibility is applied to what comes back, so a
-  conversation whose own notes fill that neighbourhood leaves fewer places for
-  the project's memories — and a project memory that would have ranked
-  hundred-and-first is not reached at all. Narrowing the store's own filter
-  instead would make the tenant key on that line a compound one, and that line
-  is the isolation boundary.
-- **No knowledge graph, contradiction detection, or consolidation.** A memory
-  that contradicts an older one simply outranks it as the older one decays;
-  nothing detects the conflict or reconciles the two.
-
-## Configuration
-
-| Variable | Default | |
-|---|---|---|
-| `DATABASE_URL` | unset | a PostgreSQL connection URL. **Set, it selects the [PostgreSQL backend](#postgresql)** and the three S3 variables below are not read |
-| `VECTOR_BUCKET` | — | **required without `DATABASE_URL`.** S3 Vectors bucket holding the memories |
-| `VECTOR_INDEX` | `memories` | index within it |
-| `STATE_BUCKET` | — | **required without `DATABASE_URL`.** Ordinary S3 bucket for counters and the recency index |
-| `KNOWLEDGE_BASE_ID` | unset | Bedrock Knowledge Base behind `search_docs`; unset, the tool is not offered at all |
-| `EMBEDDING_PROVIDER` | `bedrock` | `bedrock` or `openai` |
-| `EMBEDDING_MODEL` | `amazon.titan-embed-text-v2:0` | `text-embedding-3-small` under `openai` |
-| `EMBEDDING_DIM` | `1024` | `1536` under `openai`. Must equal the index's dimension |
-| `EMBEDDING_BASE_URL` | — | **required under `openai`.** OpenAI-compatible base |
-| `EMBEDDING_API_KEY` | — | **required under `openai`** |
-| `RECALL_MIN_SIMILARITY` | `0.1` | relevance floor, in (0, 1] — model-specific, see below |
-| `AWS_REGION` | `ap-northeast-2` | |
-| `PORT` | `3000` | |
-| `MCP_API_KEY` | unset | when set, every request must present it as a bearer token |
-| `STATS_FLUSH_MS` | `30000` | how often a pod pushes its counters |
-| `STATS_COMPACT_THRESHOLD` | `20` | a reader folds shards in once more than this many are *older than the lag* |
-
-All of it is validated before the port is bound, so a missing bucket name — or
-neither backend configured, which is refused by name — stops a rollout at the
-probe rather than surfacing inside somebody's agent run. So does a database the
-process cannot reach: the schema is created before the port is bound.
-
-Bedrock is the default because it needs no API key — the pod's own role covers
-it, so there is no secret to mount or rotate — and it runs in the same region as
-the vector bucket, which takes an internet round trip off every recall.
-
-### Calibrating the relevance floor
-
-`RECALL_MIN_SIMILARITY` is the one model-specific number a deployment sets —
-there is a second one compiled in, below — and getting it wrong is quiet in both
-directions: too high and every query answers "nothing is stored", too low and
-unrelated memories come back as weak matches.
-
-Measured on Titan v2 (normalised, 1024d), over real memories and queries:
-
-| | cosine |
-|---|---|
-| correct answer to a question phrased differently | 0.15 – 0.41 |
-| a different memory from the same project | 0.04 – 0.19 |
-| a question about something not stored at all | < 0.05 |
-| the same fact reworded | 0.72 |
-| the same fact with a typo | 0.99 |
-
-Hence `0.1`. **These numbers do not transfer between models** — a model whose
-correct answers sit at 0.8 needs this raised to match. To recalibrate: embed a
-handful of queries you know the answers to, plus a few you know are absent, and
-put the floor between the two clusters.
-
-Zero is refused rather than accepted, and the process stops at boot if it is
-set. A floor of zero admits every hit, and confidence is expressed as a multiple
-of the floor — so every result, however remote, would reach the model labelled
-HIGH CONFIDENCE.
-
-Ranking survives a model swap untouched. Which results come back above the floor
-is decided by a *fraction of the top match*, and the composite scales similarity
-the same way, so neither carries an absolute cosine.
-
-### The other cosine, and why it is not configurable
-
-`remember` treats a new memory as already known above **0.92**, which on the
-table above sits between the same fact reworded and the same fact with a typo —
-so only near-verbatim repetition merges. That number is compiled in, not an
-environment variable, and the reason is worth stating because it cuts against
-the floor above.
-
-Declining to write is *silent*: the caller is told the fact is already known,
-and the fact is never stored. A knob that guards a silent failure is a knob
-nobody knows to turn — an operator tunes the recall floor because bad recall is
-visible, but nothing shows them a memory that was never written. So dedup does
-not rely on the cosine alone. It also requires the two texts to share half their
-words, which no embedding model gets a vote on: under a model whose
-similarities are compressed into a narrow band, two unrelated facts can clear
-0.92, and the wording is what stops them merging.
-
-The consequence is that a model swap does not require re-measuring this the way
-it requires re-measuring the floor. The failure it can still produce is a
-duplicate rather than a lost memory, which is the direction worth failing in.
-
-### What a single call may carry
-
-Compiled in rather than configurable, and written down here because a refused
-`remember` otherwise sends someone reading source:
-
-| | |
-|---|---|
-| `content` | 32,000 bytes |
-| `category` | 128 bytes |
-| `tags` | 20 entries, 64 bytes each |
-| `query` on `search_docs` | 1,000 characters |
-| `limit` on `recall`, `list_memories` and `search_docs` | 1 – 50 |
-
-Bytes rather than characters for the three that reach a vector, because the
-ceiling underneath them is measured that way: 40 KB of metadata per vector, of
-which the filterable half — where `category` lands — is 2 KB. The `search_docs`
-query is the exception, counted in characters because that is how the Retrieve
-API counts it. All of it is checked before anything is sent, so a model that
-overshoots is told which field to shorten instead of getting a size back from
-AWS that names neither the field nor the limit.
-
-`memory_stats` has a ceiling of its own: it counts index keys and stops at
-10,000, past which it reports a lower bound and says so. The cap is on keys
-scanned rather than on memories counted, so a caller whose totals were thinned
-by another thread's notes is told the same thing. `search_docs` has one
-on the way out rather than in: an excerpt is cut at 2,000 characters, with a
-note saying so and pointing at the source. How large a chunk is belongs to the
-knowledge base's ingestion and not to this server, and a generously-chunked
-library could otherwise spend a run's context on a single call.
-
-Omitted arguments have compiled-in answers too. `recall` takes a mode —
-**precision** for few, closely-matching results, **balanced** (the default) for
-the usual trade-off, **exploratory** for more results on looser matching, which
-is what to reach for when a balanced search found nothing — and an omitted
-`limit` is whatever that mode allows: 3, 5 and 10 respectively. `list_memories`
-returns 20, and `search_docs` 5, the knowledge base's own default.
-
-### Authentication has two modes
-
-With `MCP_API_KEY` set, every request must present it as `Authorization: Bearer
-<key>`, compared in constant time. **With it unset, the server answers anyone
-that can reach it.**
-
-The open mode is the intended one here: a Deployment behind a ClusterIP with no
-ingress, where the network is the boundary and a shared secret every pod already
-reaches adds something to rotate without adding something it protects against.
-That holds only while nothing routes to it from outside, so the process states
-which mode it is in on every start. **If you expose it, set the key.**
-
-Note that authentication and tenancy are different questions. The key says a
-caller may talk to the server; the header says whose memories they get.
-
-## Creating the vector index
-
-S3 only — PostgreSQL creates its own schema at boot. Do this before the first
-deploy. **Dimension, distance metric and the
-non-filterable metadata keys cannot be changed after creation** — changing any of
-them means a new index and re-embedding everything, so they belong in IaC rather
-than in a console session.
+Agent Studio의 실행이 끝난 뒤에도 프로젝트 결정과 대화 메모리를 보존하는 MCP 서버다.
+메모리 저장과 의미 기반 검색만 담당하며 RAG 문서, chunk, Knowledge Graph는
+[`agent-memory`](https://github.com/opspresso/agent-memory)가 담당한다.
+
+## 기능
+
+| Tool | 역할 |
+| --- | --- |
+| `recall(query, limit?, mode?)` | 현재 프로젝트와 대화에서 의미가 가까운 메모리를 찾는다 |
+| `remember(content, type?, category?, tags?, scope?)` | 프로젝트 또는 현재 대화에 메모리를 저장한다 |
+| `list_memories(type?, limit?)` | 볼 수 있는 메모리를 최신순으로 나열한다 |
+| `forget(id)` | 현재 프로젝트의 메모리를 삭제한다 |
+| `memory_stats()` | 볼 수 있는 메모리를 유형별로 정확히 집계한다 |
+
+`search_docs`는 제공하지 않는다. 문서 검색이 필요하면 Agent Memory의 HTTP/MCP
+interface를 사용한다.
+
+## 구조
+
+영속 저장소는 pgvector extension이 설치된 PostgreSQL 하나다. MinIO, S3, S3 Vectors를
+사용하지 않는다.
+
+`memories` 테이블은 다음 데이터를 한 행에 둔다.
+
+- 메모리 본문, 유형, category, tags, scope와 conversation
+- 의미 검색용 pgvector embedding
+- recall 횟수와 마지막 recall 시각
+
+목록은 `created_at` index, 통계는 SQL `GROUP BY`, 사용 횟수는 atomic `UPDATE`로 처리한다.
+별도 object index, counter shard, flush timer는 없다. 벡터 열은 차원을 고정하지 않아 다른
+차원의 모델로 새 database를 시작할 수 있지만, 한 database 안에서 embedding 차원을 섞을
+수는 없다. 모델을 바꾸면 기존 메모리를 비우거나 전부 다시 embedding해야 한다.
+
+서버가 시작될 때 schema를 멱등하게 생성한다. v0.8의 `metadata`/`objects` schema를 발견하면
+기존 테이블을 삭제하고 현재 schema를 만든다. 개발 단계의 의도적인 파괴적 전환이며 기존
+S3 또는 PostgreSQL 데이터 migration은 제공하지 않는다.
+
+## 요구 사항
+
+- Node.js 24 이상
+- PostgreSQL 18과 pgvector
+- Bedrock 또는 OpenAI-compatible embedding endpoint
+
+## 설정
+
+| 변수 | 기본값 | 설명 |
+| --- | --- | --- |
+| `DATABASE_URL` | 없음 | 필수 PostgreSQL connection URL |
+| `PORT` | `3000` | HTTP listen port |
+| `MCP_API_KEY` | 없음 | 설정하면 `Authorization: Bearer …`를 요구한다 |
+| `EMBEDDING_PROVIDER` | `bedrock` | `bedrock` 또는 `openai` |
+| `EMBEDDING_BASE_URL` | 없음 | OpenAI-compatible endpoint의 `/v1` base URL |
+| `EMBEDDING_API_KEY` | 없음 | OpenAI-compatible endpoint key |
+| `EMBEDDING_MODEL` | provider 기본값 | 전송할 embedding model id |
+| `EMBEDDING_DIM` | Bedrock `1024`, OpenAI `1536` | 응답 vector 차원 |
+| `AWS_REGION` | `ap-northeast-2` | Bedrock을 사용할 때의 region |
+| `RECALL_MIN_SIMILARITY` | `0.1` | 무관한 후보를 제거하는 cosine 하한 `(0, 1]` |
+
+`VECTOR_BUCKET`, `VECTOR_INDEX`, `STATE_BUCKET`, `KNOWLEDGE_BASE_ID`, `STATS_FLUSH_MS`,
+`STATS_COMPACT_THRESHOLD`는 제거됐다.
+
+IDC에서는 AWS 의존성을 피하기 위해 Agent Studio와 같은 OpenAI-compatible embedding
+endpoint를 사용하는 구성을 권장한다.
 
 ```bash
-aws s3vectors create-vector-bucket --vector-bucket-name agent-studio-vector
-aws s3vectors create-index \
-  --vector-bucket-name agent-studio-vector \
-  --index-name memories \
-  --data-type float32 \
-  --dimension 1024 \
-  --distance-metric cosine \
-  --metadata-configuration '{"nonFilterableMetadataKeys":["content","createdAt","tags","trustBase"]}'
+export DATABASE_URL=postgres://mcp_memory:mcp_memory@127.0.0.1:5434/mcp_memory
+export EMBEDDING_PROVIDER=openai
+export EMBEDDING_BASE_URL=http://127.0.0.1:8001/v1
+export EMBEDDING_API_KEY=not-required
+export EMBEDDING_MODEL=selfhosted/Qwen/Qwen3-Embedding-4B
+export EMBEDDING_DIM=2560
 ```
 
-`--dimension` is 1024 for Titan v2, 1536 for `text-embedding-3-small`. It must
-match `EMBEDDING_DIM` and what the model actually returns; the server checks
-every embedding against it and fails with that explanation rather than writing
-something the index will reject.
+## 로컬 개발
 
-The four non-filterable keys must be exactly those. They are where the body and
-its provenance live, and the list cannot be changed once the index exists.
-
-## The documentation library (optional)
-
-Setting `KNOWLEDGE_BASE_ID` adds a sixth tool, `search_docs`, backed by a
-Bedrock Knowledge Base. Unset, the tool is not offered — not listed, not
-callable — and the SDK behind it is never loaded.
-
-The knowledge base is created outside this repo, like the vector index, and the
-division of labour is strict: the KB owns its own S3 Vectors index (which may
-live in the same vector bucket, under a different index name) and its own
-ingestion — chunking, embedding, and syncing whatever S3 bucket holds the source
-documents. This server only queries it, over the `Retrieve` API. The KB embeds
-the query itself with whatever model it was built on, so the `EMBEDDING_*`
-settings play no part and cannot mismatch it.
-
-Two things the deployment must line up:
-
-- The pod's role needs `bedrock:Retrieve` on the knowledge base's ARN.
-- The KB must live in `AWS_REGION` — the server uses one region for everything.
-
-Unlike the memories, the library is **shared across all tenants**. A tenant
-header is still required on every request, but it does not filter documents;
-two projects with different tenants search the same library.
-Memories remain strictly per-tenant.
-
-## Registering it with Agent Studio
-
-The Service is cluster-internal, so its address resolves to a private IP that
-Agent Studio's outbound guard blocks by default. `MCP_INTERNAL_HOST_SUFFIXES`
-already carries `agent-mcps.svc.cluster.local` for the sibling servers, which is
-what admits this one too.
-
-1. **MCP servers → Add**
-   - URL: `http://mcp-memory.agent-mcps.svc.cluster.local/mcp`
-   - Description: one line — it becomes a row in the model's system prompt
-   - No tenant header needed: Agent Studio stamps every MCP request with
-     `X-Tenant-Id: <project name>`, and this server reads it when no
-     explicit `X-Memory-Tenant` is configured — each project lands in its own
-     tenant with zero per-project setup.
-2. **Test connection and the capability-catalog probe can list the tools.** They
-   carry no project and therefore no tenant, but discovery is not a memory
-   operation. A tool call without either tenant header is still refused; a bound
-   project run carries the automatic header.
-3. Bind it on the project version that should have a memory.
-
-To *share* one memory across projects — or point one version at a different
-bucket — set `X-Memory-Tenant` explicitly (on the entry, or as a per-version
-header override); an explicit tenant always wins over the automatic project
-name. There is no per-user scope. Conversation scope is automatic when Agent
-Studio supplies `X-Conversation-Id`; the tenant override changes only which
-project-level memory bucket is used.
-
-## Run
-
-Bedrock, the default — the pod's role covers the embeddings, so there is nothing
-else to pass:
-
-    VECTOR_BUCKET=… STATE_BUCKET=… node dist/main.js
-
-An OpenAI-compatible endpoint instead. `EMBEDDING_PROVIDER` is what selects it;
-without that the other two are read by nobody and the process still calls
-Bedrock:
-
-    EMBEDDING_PROVIDER=openai EMBEDDING_BASE_URL=… EMBEDDING_API_KEY=… \
-      VECTOR_BUCKET=… STATE_BUCKET=… node dist/main.js
-
-PostgreSQL instead of both buckets, with no AWS anywhere — the container is
-the same image:
-
-    docker run --rm -p 3000:3000 \
-      -e DATABASE_URL=postgres://memory:secret@postgres:5432/memory \
-      -e EMBEDDING_PROVIDER=openai \
-      -e EMBEDDING_BASE_URL=http://llm.internal:8000/v1 \
-      -e EMBEDDING_API_KEY=… \
-      -e EMBEDDING_MODEL=text-embedding-3-small -e EMBEDDING_DIM=1536 \
-      ghcr.io/opspresso/mcp-memory:latest
-
-    POST /mcp      JSON-RPC; Authorization: Bearer <MCP_API_KEY> when a key is set
-    GET  /health   liveness
-
-The protocol is served by `@modelcontextprotocol/server`, which answers **both
-eras from that one endpoint**: a client opening with `server/discover` gets
-revision `2026-07-28`, one opening with the `initialize` handshake is served
-statelessly as before. The server holds nothing between requests either way.
-Requests carrying an `Origin` header are refused with 403: this cluster-internal
-endpoint has no browser caller, and Streamable HTTP requires that boundary
-against DNS rebinding.
-
-The tenant header is this server's own, and it is read when a tool runs rather
-than when a client connects: the handshake says what this server is, which is
-true whoever is asking, so a client that connects lazily is not told about a
-header problem before it has asked for anything. A call without the header comes
-back as a tool error naming the header to set.
-
-AWS credentials, where the deployment uses AWS, come from the pod's role. Never
-bake keys into the image.
-
-The process logs one JSON line per event. Every tool call leaves a `tool_call`
-line on stdout — the tool, the tenant, how long it took and whether it answered
-(`ok`) — and a failure that reaches a tool is written to stderr as well, so an
-outage shows up in the pod's logs and not only inside somebody's agent run.
-Neither carries memory content or a recall query: a failing dependency is
-identified by the tool and the tenant, not by what was being remembered.
-
-    {"level":"info","event":"tool_call","tenant":"demo","tool":"recall","ms":312,"ok":true}
-    {"level":"error","event":"tool_failed","message":"…","tenant":"demo","tool":"recall"}
-
-## Develop
-
-Node 24 or newer — `package.json` requires it, and the image and CI both run it.
+로컬 PostgreSQL을 시작한다. `docker compose down -v`는 개발 데이터를 삭제하므로 대상을
+확인하지 않고 실행하지 마라.
 
 ```bash
-npm install
-npm run dev          # tsx, no build step
+docker compose up -d postgres
+npm ci
+DATABASE_URL=postgres://mcp_memory:mcp_memory@127.0.0.1:5434/mcp_memory npm run dev
+```
+
+검증은 다음과 같이 실행한다.
+
+```bash
 npm run typecheck
 npm test
+npm run build
+TEST_DATABASE_URL=postgres://mcp_memory:mcp_memory@127.0.0.1:5434/mcp_memory npm test
 ```
 
-`typecheck` + `test` are the checks; `build` is the third.
-
-The PostgreSQL backend is tested against a real database when one is named,
-and skipped — visibly, with the reason — when none is. CI names one
-(`pgvector/pgvector:pg17` as a service); locally:
+## 실행과 health check
 
 ```bash
-docker run -d -p 5432:5432 -e POSTGRES_USER=memory -e POSTGRES_PASSWORD=memory \
-  -e POSTGRES_DB=mcp_memory_test pgvector/pgvector:pg17
-TEST_DATABASE_URL=postgres://memory:memory@localhost:5432/mcp_memory_test npm test
+npm run build
+DATABASE_URL=postgres://mcp_memory:secret@postgres:5432/mcp_memory npm start
 ```
 
-The tests empty both tables before each case, so the database is theirs alone.
+- MCP endpoint: `POST /mcp`
+- liveness: `GET /health`
+- tenant: `X-Tenant-Id` header
+- 선택 conversation scope: `X-Conversation-Id` header
 
-S3 Vectors has no local emulator, so `src/testing/fakes.ts` stands in for both
-stores and for the embedder. Its similarity scale is harsher than a real model's
-— roughly the fraction of words two texts share — and fixtures have to be
-written for that; the file documents the measured numbers.
+브라우저 origin 요청은 거부한다. `MCP_API_KEY`를 설정한 배포는 Bearer token 없이는 MCP
+호출을 허용하지 않는다.
 
-### Releasing
+## IDC 배포
 
-A release is a tag, and everything else follows from it: CI runs the checks,
-cuts a GitHub release whose notes are the commit subjects since the previous tag
-bar the release commit itself, pushes the image to ECR and GHCR, and dispatches
-to the GitOps repository, which is what puts it on alpha.
+[`dockpad`](https://github.com/opspresso/dockpad)의 IDC 배포처럼 Agent Studio가 소유한 PostgreSQL 18/pgvector와
+`agent-studio_default` network를 공유한다. 배포 절차는 다음 계약을 지킨다.
+
+1. 배포 스크립트가 공유 PostgreSQL에 `mcp_memory` database를 만든다.
+2. mcp-memory Compose project는 `agent-studio_default` external network에 참여한다.
+3. `DATABASE_URL`은 `postgres:5432/mcp_memory`를 가리킨다.
+4. embedding은 IDC에서 접근 가능한 OpenAI-compatible endpoint를 사용한다.
+5. container health check는 `/health`를 확인한다.
+6. backup은 `pg_dump mcp_memory`를 포함한다.
+
+mcp-memory에는 MinIO 환경 변수나 bucket 초기화가 없다. Agent Studio artifact bucket과 Agent
+Memory RAG bucket은 각 소유 project가 MinIO에 만들고 별도로 backup한다.
+
+예시 service 설정은 다음과 같다.
+
+```yaml
+services:
+  mcp-memory:
+    image: ${IMAGE_REGISTRY}/mcp-memory:${MCP_MEMORY_TAG}
+    restart: unless-stopped
+    environment:
+      PORT: "80"
+      DATABASE_URL: postgres://agent_studio:${POSTGRES_PASSWORD}@postgres:5432/mcp_memory
+      EMBEDDING_PROVIDER: openai
+      EMBEDDING_BASE_URL: ${EMBEDDING_BASE_URL}
+      EMBEDDING_API_KEY: ${EMBEDDING_API_KEY}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL}
+      EMBEDDING_DIM: ${EMBEDDING_DIM}
+      RECALL_MIN_SIMILARITY: "0.5"
+    networks:
+      data:
+        aliases:
+          - mcp-memory.agent-mcps.svc.cluster.local
+
+networks:
+  data:
+    external: true
+    name: agent-studio_default
+```
+
+## 데이터 격리
+
+tool argument로 tenant나 conversation을 받지 않는다. 서버가 인증된 요청 header에서 결정한
+tenant와 conversation을 모든 SQL 조건에 넣는다. project scope 메모리는 tenant 전체에,
+conversation scope 메모리는 같은 tenant와 conversation에만 보인다. 다른 tenant의 id를 알아도
+조회하거나 삭제할 수 없다.
+
+메모리 본문은 최대 32,000 bytes, category는 128 bytes, tag는 최대 20개이며 각 64 bytes다.
+로그에는 query, 본문, tag, conversation id, embedding을 기록하지 않는다.
+
+## Release
+
+release는 `v*` tag가 시작한다. workflow가 typecheck, PostgreSQL integration을 포함한 전체
+test, container build를 검증한 뒤 GitHub Release와 ECR/GHCR image를 만들고 alpha GitOps
+배포를 요청한다.
+
+breaking change는 minor version을 올린다. version은 `package.json`, `package-lock.json`,
+`src/version.ts`에서 일치해야 한다.
 
 ```bash
-npm version 0.4.3 --no-git-tag-version
+RELEASE_VERSION=0.9.0
+npm version "$RELEASE_VERSION" --no-git-tag-version
 git add package.json package-lock.json src/version.ts
-git commit -m "chore: release v0.4.3"
-git tag v0.4.3
-git push origin main v0.4.3
+git commit -m "chore: release v$RELEASE_VERSION"
+git tag "v$RELEASE_VERSION"
+git push origin main "v$RELEASE_VERSION"
 ```
-
-The version is written in three places — `package.json`, its lock file, and
-`SERVER_VERSION` in `src/version.ts`, which is what a client is told it connected
-to. `npm version` moves all three, the third through `scripts/sync-version.mjs`
-on npm's `version` hook, and the check in `src/version.test.ts` fails the build if
-they ever part company. `--no-git-tag-version` leaves the commit and the tag to
-the lines below it, so the history reads `chore: release …` rather than npm's
-bare version.

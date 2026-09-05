@@ -18,15 +18,13 @@
  * is refused by name.
  */
 
-import { createHash } from "node:crypto";
-
 export const CONVERSATION_ID_HEADER = "x-conversation-id";
 
 /**
  * What the platform sends: at most 512 characters of printable ASCII, no
  * whitespace — the platform's own bound and its own encoding (it percent-encodes
- * anything else). Held to exactly that here, because the value lands in a
- * metadata filter and, hashed, in an S3 key path.
+ * anything else). Held to exactly that here before PostgreSQL uses it as a
+ * visibility key.
  */
 const MAX_LENGTH = 512;
 const ALLOWED = /^[\x21-\x7e]+$/;
@@ -57,14 +55,4 @@ export function parseConversation(raw: string | string[] | undefined | null): st
     );
   }
   return value;
-}
-
-/**
- * The conversation as an S3 key segment: a fixed-width digest rather than the
- * value, because the value may carry `#`, `/` and `%` — every character the
- * recency index splits and prefixes on. Not a secret: it only has to be stable
- * and collision-free enough to tell one thread's index entries from another's.
- */
-export function conversationKeyPart(conversation: string): string {
-  return createHash("sha256").update(conversation).digest("hex").slice(0, 16);
 }

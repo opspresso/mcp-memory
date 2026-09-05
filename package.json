@@ -15,10 +15,7 @@
     "version": "node scripts/sync-version.mjs && git add src/version.ts"
   },
   "dependencies": {
-    "@aws-sdk/client-bedrock-agent-runtime": "^3.1106.0",
     "@aws-sdk/client-bedrock-runtime": "^3.1100.0",
-    "@aws-sdk/client-s3": "^3.1096.0",
-    "@aws-sdk/client-s3vectors": "^3.1096.0",
     "@modelcontextprotocol/node": "^2.0.0",
     "@modelcontextprotocol/server": "^2.0.0",
     "pg": "^8.23.0"

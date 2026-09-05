@@ -9,10 +9,9 @@
 
 import assert from "node:assert/strict";
 import { describe, it, mock } from "node:test";
-import type { DocsRetriever } from "./docs.js";
 import type { MemoryService } from "./service.js";
-import { MAX_CONTENT_BYTES, VectorStoreError } from "./store/vectors.js";
-import { callTool, MAX_QUERY_CHARS, MAX_TAGS, SEARCH_DOCS_TOOL, TOOLS, toolCatalogue } from "./tools.js";
+import { MAX_CONTENT_BYTES, MemoryStoreError } from "./store/memoryStore.js";
+import { callTool, MAX_TAGS, TOOLS } from "./tools.js";
 
 const seen: unknown[] = [];
 
@@ -38,7 +37,7 @@ const service: MemoryService = {
 
 const failing: MemoryService = {
   recall: async () => {
-    throw new Error("S3 is having a day");
+    throw new Error("PostgreSQL is having a day");
   },
   remember: async () => "",
   list: async () => "",
@@ -46,13 +45,12 @@ const failing: MemoryService = {
   stats: async () => "",
 };
 
-/** A store refusing the metadata budget — what the model sent, not a dependency failing. */
+/** A store refusing input the model sent, not a dependency failing. */
 const overBudget: MemoryService = {
   recall: async () => "",
   remember: async () => {
-    throw new VectorStoreError(
-      "the memory and its labels are 41000 bytes against a 40000 byte limit. " +
-        "Shorten the tags, or store a shorter fact.",
+    throw new MemoryStoreError(
+      "content is too large. Store a shorter fact.",
     );
   },
   list: async () => "",
@@ -73,21 +71,10 @@ describe("tool definitions", () => {
     );
   });
 
-  it("offers search_docs only when a knowledge base is configured", () => {
-    // The memories-only guarantee hangs on this split: `TOOLS` stays the five,
-    // and `toolCatalogue` is the one place the docs tool joins them.
-    assert.ok(!TOOLS.includes(SEARCH_DOCS_TOOL));
-    assert.equal(toolCatalogue(false), TOOLS);
-    assert.deepEqual(
-      toolCatalogue(true).map((tool) => tool.name),
-      [...TOOLS.map((tool) => tool.name), "search_docs"],
-    );
-  });
-
   it("does not offer a tenant argument on any tool", () => {
     // The isolation boundary is the header. A tenant argument would let the
     // model name its own — including a model talked into it by text it just read.
-    for (const tool of toolCatalogue(true)) {
+    for (const tool of TOOLS) {
       const properties = (tool.inputSchema as { properties?: Record<string, unknown> }).properties;
       assert.ok(!properties || !("tenant" in properties), `${tool.name} exposes a tenant argument`);
     }
@@ -193,7 +180,7 @@ describe("remember", () => {
     assert.equal(result.isError, true);
   });
 
-  it("measures the body in bytes, because the metadata budget is bytes", async () => {
+  it("measures the body limit in bytes", async () => {
     // Korean is three bytes a character, so a character-based check would pass
     // content the service then rejects.
     const korean = "가".repeat(MAX_CONTENT_BYTES / 3 + 1);
@@ -209,11 +196,7 @@ describe("remember", () => {
     assert.notEqual(result.isError, true);
   });
 
-  it("refuses labels that would overflow the metadata budget", async () => {
-    // Content is not the only thing a model chooses. The category shares a 2 KB
-    // filterable budget it can exhaust alone, and twenty tags share a 40 KB one
-    // with a body that may be 32 KB — both used to reach AWS and come back as a
-    // size the model could not attribute to anything it sent.
+  it("refuses oversized labels", async () => {
     const longCategory = await call("remember", { content: "a fact", category: "d".repeat(3000) });
     assert.equal(longCategory.isError, true);
     assert.match(longCategory.content[0]!.text, /`category` may be at most/);
@@ -255,73 +238,12 @@ describe("list_memories and forget", () => {
   });
 });
 
-describe("search_docs", () => {
-  const docsSeen: unknown[] = [];
-  const retriever: DocsRetriever = {
-    retrieve: async (query, limit) => {
-      docsSeen.push({ query, limit });
-      return [{ excerpt: "an excerpt", source: "s3://docs/a.md", score: 0.5 }];
-    },
-  };
-
-  function search(args: Record<string, unknown>, docs: DocsRetriever = retriever) {
-    docsSeen.length = 0;
-    return callTool(service, { tenant: "demo" }, "search_docs", args, docs);
-  }
-
-  it("searches with the knowledge base's default limit", async () => {
-    const result = await search({ query: "how do we deploy" });
-    assert.match(result.content[0]!.text, /^\[DOCS\]/);
-    assert.deepEqual(docsSeen[0], { query: "how do we deploy", limit: 5 });
-  });
-
-  it("passes a valid limit through and refuses one outside the range", async () => {
-    await search({ query: "x", limit: 3 });
-    assert.deepEqual(docsSeen[0], { query: "x", limit: 3 });
-
-    for (const limit of [0, 51, 1.5, "3"]) {
-      const result = await search({ query: "x", limit });
-      assert.equal(result.isError, true, `should reject limit ${JSON.stringify(limit)}`);
-    }
-  });
-
-  it("refuses an empty query and an oversized one, in characters", async () => {
-    assert.equal((await search({ query: "" })).isError, true);
-
-    // Characters, not bytes: the Retrieve API's ceiling is measured that way,
-    // unlike the byte budgets on remember.
-    const result = await search({ query: "가".repeat(MAX_QUERY_CHARS + 1) });
-    assert.equal(result.isError, true);
-    assert.match(result.content[0]!.text, /characters/);
-  });
-
-  it("does not exist without a knowledge base, even at the dispatch layer", async () => {
-    // The server already rejects the name when the catalogue omits it; this is
-    // the dispatch refusing to depend on that.
-    const result = await callTool(service, { tenant: "demo" }, "search_docs", { query: "x" });
-    assert.equal(result.isError, true);
-    assert.match(result.content[0]!.text, /unknown tool "search_docs"/);
-  });
-
-  it("blames the documentation index, not the memory store, when the KB fails", async () => {
-    const result = await search({ query: "x" }, {
-      retrieve: async () => {
-        throw new Error("KB is having a day");
-      },
-    });
-    assert.equal(result.isError, true);
-    assert.match(result.content[0]!.text, /documentation index could not be searched/);
-    assert.match(result.content[0]!.text, /KB is having a day/);
-    assert.ok(!/memory store/.test(result.content[0]!.text));
-  });
-});
-
 describe("failures", () => {
   it("reports a storage failure as a tool error, not a protocol one", async () => {
     const result = await callTool(failing, { tenant: "demo" }, "recall", { query: "x" });
     assert.equal(result.isError, true);
     assert.match(result.content[0]!.text, /could not complete this request/);
-    assert.match(result.content[0]!.text, /S3 is having a day/);
+    assert.match(result.content[0]!.text, /PostgreSQL is having a day/);
   });
 
   it("rejects a tool it does not have", async () => {
@@ -337,7 +259,7 @@ describe("failures", () => {
     try {
       const result = await callTool(overBudget, { tenant: "demo" }, "remember", { content: "x" });
       assert.equal(result.isError, true);
-      assert.match(result.content[0]!.text, /Shorten the tags/);
+      assert.match(result.content[0]!.text, /Store a shorter fact/);
       assert.doesNotMatch(result.content[0]!.text, /could not complete this request/);
       assert.equal(wrote.mock.callCount(), 0, "nothing for an operator to act on");
     } finally {

@@ -8,10 +8,9 @@
  * one OpenAI-compatible base URL; embeddings go the same way, and the pod stays
  * small enough that adding one is free.
  *
- * The dimension is checked on every response rather than trusted. An S3 Vectors
- * index fixes its dimension at creation and will not change it, so a model
- * swapped underneath this server does not degrade search — it fails every
- * write, and it should say so in terms that name the cause.
+ * The dimension is checked on every response rather than trusted. PostgreSQL
+ * cannot compare vectors of different widths, so a model swap must fail with
+ * the cause named instead of degrading search.
  */
 
 import type { BedrockRuntimeClient } from "@aws-sdk/client-bedrock-runtime";
@@ -26,10 +25,8 @@ export class EmbeddingError extends Error {}
  * Guards every provider's output, because the failure it catches is expensive
  * and silent otherwise.
  *
- * An S3 Vectors index fixes its dimension at creation and will not change it,
- * so a model swapped underneath this server does not degrade search — it fails
- * every write, with an error from AWS that names neither the model nor the
- * setting. Saying it here is what makes that recoverable.
+ * Existing PostgreSQL rows fix the usable dimension for a deployment. A model
+ * swapped underneath the server must fail before incompatible vectors mix.
  */
 function validate(embedding: unknown, dimension: number, model: string): number[] {
   if (!Array.isArray(embedding) || embedding.some((n) => typeof n !== "number")) {
@@ -37,13 +34,12 @@ function validate(embedding: unknown, dimension: number, model: string): number[
   }
   if (embedding.length !== dimension) {
     throw new EmbeddingError(
-      `model "${model}" returned ${embedding.length} dimensions but the vector index expects ` +
-        `${dimension}. An index's dimension cannot be changed after creation: either set ` +
-        "EMBEDDING_DIM and EMBEDDING_MODEL to match the index, or create a new index for this model.",
+      `model "${model}" returned ${embedding.length} dimensions but this deployment expects ` +
+        `${dimension}. Set EMBEDDING_DIM and EMBEDDING_MODEL to match, then clear or re-embed ` +
+        "existing memories before changing dimensions.",
     );
   }
-  // Zero vectors are rejected by S3 Vectors under the cosine metric, and a
-  // model that returns one for real input is broken in a way worth naming.
+  // Cosine distance is undefined for a zero vector.
   if (embedding.every((n) => n === 0)) {
     throw new EmbeddingError("the embedding service returned an all-zero vector");
   }
@@ -111,14 +107,10 @@ export class HttpEmbedder implements Embedder {
 /**
  * Amazon Titan Text Embeddings, over Bedrock.
  *
- * The default, and the one the deployment uses. It needs no API key — the pod's
- * own role covers it, so there is no secret to mount, rotate, or leak into a
- * log — and it runs in the same region as the vector bucket, which takes an
- * internet round trip off the critical path of every recall.
+ * The default provider. It needs no API key because the pod's role covers it.
  *
  * Titan v2 will return 256, 512 or 1024 dimensions on request. Whichever the
- * index was built with has to be asked for explicitly: the model's own default
- * is 1024, and a mismatch is not recoverable once vectors exist.
+ * deployment expects has to be asked for explicitly; the model default is 1024.
  */
 export interface BedrockEmbeddingOptions {
   model: string;
