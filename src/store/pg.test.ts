@@ -1,6 +1,7 @@
 /** PostgreSQL adapter integration tests, enabled by TEST_DATABASE_URL. */
 
 import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { after, before, beforeEach, describe, it, mock } from "node:test";
 import pg from "pg";
@@ -28,10 +29,19 @@ function memory(overrides: Partial<StoredMemory> = {}): StoredMemory {
 
 describe("PostgreSQL memory store", { skip }, () => {
   let pool: pg.Pool;
+  let admin: pg.Pool;
+  const schema = `memory_test_${randomUUID().replaceAll("-", "")}`;
   let memories: PgMemoryStore;
 
   before(async () => {
-    pool = new pg.Pool({ connectionString: DATABASE_URL });
+    admin = new pg.Pool({ connectionString: DATABASE_URL });
+    await admin.query("CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA public");
+    await admin.query(`CREATE SCHEMA ${schema}`);
+    const connection = new URL(DATABASE_URL!);
+    connection.searchParams.set("options", `-c search_path=${schema},public`);
+    pool = new pg.Pool({ connectionString: connection.toString() });
+    const { rows } = await pool.query("SELECT current_schema() AS schema");
+    assert.equal(rows[0]?.schema, schema);
     await ensureSchema(pool);
     memories = new PgMemoryStore(pool);
   });
@@ -42,13 +52,20 @@ describe("PostgreSQL memory store", { skip }, () => {
 
   after(async () => {
     await pool?.end();
+    if (admin) {
+      try {
+        await admin.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
+      } finally {
+        await admin.end();
+      }
+    }
   });
 
   it("creates the relational schema idempotently", async () => {
     await ensureSchema(pool);
     const { rows } = await pool.query(
       "SELECT column_name FROM information_schema.columns " +
-        "WHERE table_name = 'memories' ORDER BY ordinal_position",
+        "WHERE table_schema = current_schema() AND table_name = 'memories' ORDER BY ordinal_position",
     );
     const columns = rows.map((row: { column_name: string }) => row.column_name);
     assert.ok(columns.includes("content"));

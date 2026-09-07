@@ -99,6 +99,9 @@ npm run build
 TEST_DATABASE_URL=postgres://mcp_memory:mcp_memory@127.0.0.1:5434/mcp_memory npm test
 ```
 
+통합 테스트는 실행마다 임시 schema를 만들고 종료 시 해당 schema만 삭제한다.
+연결 계정에 schema 생성 권한이 필요하며, pgvector extension이 없으면 설치를 시도한다.
+
 ## 실행과 health check
 
 ```bash
