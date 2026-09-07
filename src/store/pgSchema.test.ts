@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { ensureSchema, type SchemaPool } from "./pg.js";
+import { databaseAddress, ensureSchema, type SchemaPool } from "./pg.js";
 
 function schemaPool(legacy: boolean) {
   const statements: string[] = [];
@@ -43,5 +43,19 @@ describe("ensureSchema", () => {
 
     assert.ok(!fake.statements.some((statement) => statement.startsWith("DROP TABLE")));
     assert.ok(fake.statements.some((statement) => statement.startsWith("CREATE TABLE IF NOT EXISTS memories")));
+  });
+});
+
+
+describe("databaseAddress", () => {
+  it("reports the database without credentials or connection options", () => {
+    assert.equal(
+      databaseAddress("postgres://private-user:private-password@db:5432/memory?password=query-secret&sslkey=/private/key#private-fragment"),
+      "db:5432/memory",
+    );
+  });
+
+  it("does not echo an invalid connection string", () => {
+    assert.equal(databaseAddress("password=private-secret"), "<database url>");
   });
 });

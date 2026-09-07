@@ -105,11 +105,10 @@ export interface PgStore {
   close(): Promise<void>;
 }
 
-function redact(databaseUrl: string): string {
+export function databaseAddress(databaseUrl: string): string {
   try {
     const url = new URL(databaseUrl);
-    url.password = "";
-    return url.toString();
+    return `${url.host}${url.pathname}`;
   } catch {
     return "<database url>";
   }
@@ -126,7 +125,7 @@ export async function openPgStore(databaseUrl: string): Promise<PgStore> {
   }
   return {
     memories: new PgMemoryStore(pool),
-    description: `store: postgres at ${redact(databaseUrl)}`,
+    description: `store: postgres at ${databaseAddress(databaseUrl)}`,
     close: () => pool.end(),
   };
 }
