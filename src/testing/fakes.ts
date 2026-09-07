@@ -39,6 +39,20 @@ export class InMemoryMemoryStore implements MemoryStore {
     });
   }
 
+  async putIfAbsent(memory: StoredMemory, embedding: number[]): Promise<StoredMemory | undefined> {
+    const existing = [...this.records.values()].find(({ memory: stored }) =>
+      stored.tenantId === memory.tenantId && stored.content === memory.content &&
+      (stored.scope ?? "project") === (memory.scope ?? "project") &&
+      (memory.scope !== "conversation" || stored.conversation === memory.conversation),
+    );
+    if (existing) {
+      await this.touch(memory.tenantId, [existing.memory.id], memory.createdAt);
+      return { ...existing.memory, tags: [...existing.memory.tags] };
+    }
+    await this.put(memory, embedding);
+    return undefined;
+  }
+
   async query(
     tenantId: string,
     embedding: number[],
@@ -145,16 +159,11 @@ export class InMemoryMemoryStore implements MemoryStore {
  * Similarity here is essentially the fraction of words two texts share, which
  * is far harsher than an embedding model that understands paraphrase. Measured:
  *
- *   9 words of 10 shared → 0.93   (above the 0.92 dedup threshold)
+ *   9 words of 10 shared → 0.93
  *   7 words of 10 shared → 0.86
  *   4 words of 10 shared → 0.68
  *   nothing shared, same topic → 0.29
  *   nothing shared at all → ~0
- *
- * So a test that means "these are the same fact" must repeat nearly every word,
- * and a test that means "these are different facts" must not reuse boilerplate
- * across them — five sentences differing only in a number are one memory to
- * this embedder, and correctly so.
  */
 export class FakeEmbedder implements Embedder {
   private readonly words = new Map<string, number[]>();

@@ -24,27 +24,10 @@ import {
   relativeStanding,
   TRUST_MANUAL,
 } from "./ranking.js";
-import type { MemoryHit, MemoryStore } from "./store/memoryStore.js";
+import type { MemoryStore } from "./store/memoryStore.js";
 import type { MemoryScope, MemoryType, RankedMemory, RecallMode, StoredMemory } from "./types.js";
 import { MEMORY_TYPES, visibleTo } from "./types.js";
 
-/**
- * Above this cosine, two memories are *candidates* for being the same fact.
- *
- * Not the whole test — see `wordOverlap`. Calibrated on Titan v2, where it sits
- * between the same fact reworded (0.72) and the same fact with a typo (0.99),
- * so only near-verbatim repetition merges.
- */
-const DEDUP_THRESHOLD = 0.92;
-/**
- * How much of the two texts' wording has to coincide before a high cosine is
- * believed.
- *
- * Deliberately low. Distinct facts overlap near zero and a near-identical pair
- * well above this, so the number only has to land in a wide gap — and landing
- * low costs a duplicate, which is the cheap direction.
- */
-const DEDUP_MIN_WORD_OVERLAP = 0.5;
 /** Candidates pulled per recall before application ranking. */
 const CANDIDATE_CAP = 100;
 
@@ -91,64 +74,8 @@ function percent(value: number): string {
   return `${Math.round(value * 100)}%`;
 }
 
-/**
- * Jaccard overlap of two texts' words, 0..1 — a second opinion on the cosine.
- *
- * It exists because the cosine is the *embedding model's* opinion, and
- * `DEDUP_THRESHOLD` is calibrated for one model. On Titan a different fact from
- * the same project scores 0.04–0.19 and cannot reach it; under a model whose
- * similarities are compressed into a narrow band, two unrelated facts can. And
- * declining is silent — the caller is told the fact is already known and it is
- * never written — so that failure must not turn on a number belonging to a
- * component the deployment is free to swap.
- *
- * Word overlap belongs to the texts instead. It cannot make dedup fire where
- * the cosine did not; it can only stop it firing where the words disagree.
- */
-function wordOverlap(a: string, b: string): number {
-  // Unicode classes rather than an ASCII range: this deployment mostly holds
-  // Korean, and a split that dropped it would score every pair at zero.
-  const wordsOf = (text: string) =>
-    new Set(
-      text
-        .toLowerCase()
-        .split(/[^\p{L}\p{N}]+/u)
-        .filter(Boolean),
-    );
-  const left = wordsOf(a);
-  const right = wordsOf(b);
-  if (left.size === 0 || right.size === 0) {
-    return 0;
-  }
-  let shared = 0;
-  for (const word of left) {
-    if (right.has(word)) {
-      shared += 1;
-    }
-  }
-  return shared / (left.size + right.size - shared);
-}
-
 function day(iso: string): string {
   return iso.slice(0, 10);
-}
-
-/**
- * The closest of a set of hits, or `undefined` when there are none.
- *
- * `MemoryStore.query` returns the nearest neighbours in no promised order, so
- * every caller that needs the best one has to find it. `recall` does the same
- * thing with `Math.max` over the similarities; this is the version that has to
- * carry the hit itself.
- */
-function nearestOf(hits: readonly MemoryHit[]): MemoryHit | undefined {
-  let best: MemoryHit | undefined;
-  for (const hit of hits) {
-    if (!best || hit.similarity > best.similarity) {
-      best = hit;
-    }
-  }
-  return best;
 }
 
 /**
@@ -300,45 +227,6 @@ export class MemoryManager implements MemoryService {
   async remember(tenant: string, request: RememberRequest): Promise<string> {
     const embedding = await this.embedder.embed(request.content);
 
-    // Near-identical content merges rather than accumulating copies. Because a
-    // stored memory is never rewritten, "merge" means declining to write and
-    // pointing at what is already there — said plainly, so a model that meant
-    // to record something new can tell that it did not.
-    // Two gates, and the second is not a refinement of the first. The cosine is
-    // the embedding model's judgement; the wording is the texts' own. Declining
-    // to write loses a fact silently, so it takes both.
-    // Nearest *visible* neighbour: a fact one thread keeps to itself must not
-    // stop another thread — or the project — from writing the same fact, and
-    // "already known" must never point at a memory the caller cannot see. A
-    // handful of neighbours rather than one, since the closest may be someone
-    // else's.
-    //
-    // Found rather than taken: `MemoryStore.query` promises the nearest
-    // neighbours and says nothing about the order they arrive in, and this is
-    // the one place a wrong pick is silent — dedup compares against whichever
-    // hit came first, so under a store that does not sort, a near-verbatim
-    // repeat lands beside its twin instead of merging.
-    const nearest = nearestOf(
-      (await this.store.query(tenant, embedding, 5, request.conversation)).filter((hit) =>
-        visibleTo(hit.memory, request.conversation),
-      ),
-    );
-    if (
-      nearest &&
-      nearest.similarity >= DEDUP_THRESHOLD &&
-      wordOverlap(request.content, nearest.memory.content) >= DEDUP_MIN_WORD_OVERLAP
-    ) {
-      await this.store.touch(tenant, [nearest.memory.id], new Date(this.now()).toISOString());
-      // No percentage: the number that decided this is a cosine, and what a
-      // cosine means belongs to the embedding model rather than to the memory.
-      // That it was close enough to count as the same fact is the whole of what
-      // the model can act on.
-      return (
-        `[MEMORY] Already known — an existing memory already says this, so nothing new ` +
-        `was written.\n\n${render(nearest.memory, 1)}`
-      );
-    }
-
     const at = this.now();
     const memory: StoredMemory = {
       id: ulid(at),
@@ -355,7 +243,14 @@ export class MemoryManager implements MemoryService {
       trustBase: TRUST_MANUAL,
     };
 
-    await this.store.put(memory, embedding);
+    // Similarity cannot establish equality: a changed number or negation is a new fact.
+    const existing = await this.store.putIfAbsent(memory, embedding);
+    if (existing) {
+      return (
+        `[MEMORY] Already known — an existing memory already says this, so nothing new ` +
+        `was written.\n\n${render(existing, 1)}`
+      );
+    }
 
     return `[MEMORY] Stored as ${memory.id}.\n\n${render(memory, 1)}`;
   }

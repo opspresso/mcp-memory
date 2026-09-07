@@ -24,10 +24,8 @@ export interface Config {
   /**
    * The cosine similarity below which a hit is not relevant to the query at all.
    *
-   * The only model-specific number a deployment configures, and configurable
-   * for exactly that reason. It is not quite the only one that exists: dedup in
-   * `service.ts` compares against a compiled-in cosine too, which is why it
-   * takes a model-independent second opinion before it acts on it.
+   * The model-specific relevance floor. Duplicate detection uses exact content
+   * equality and does not depend on embedding similarity.
    *
    * Measured on Titan v2 (normalised, 1024d): a correct answer
    * scores 0.15–0.41, an unrelated one under 0.05. A model whose correct

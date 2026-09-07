@@ -14,6 +14,12 @@ Agent Studio의 실행이 끝난 뒤에도 프로젝트 결정과 대화 메모�
 | `forget(id)` | 현재 프로젝트의 메모리를 삭제한다 |
 | `memory_stats()` | 볼 수 있는 메모리를 유형별로 정확히 집계한다 |
 
+`remember`는 같은 tenant와 scope(대화 scope이면 같은 conversation)에서 본문이 완전히
+같을 때만 중복으로 처리한다. 중복 요청은 기존 메모리의 사용 횟수를 늘리고 기존 id를
+반환하며, 새 tags와 category는 반영하지 않는다. 숫자·부정어·문장 순서가 다른 본문은
+유사도가 높아도 별도로 저장한다. 동시 요청의 중복 판정과 저장은 하나의 DB transaction으로
+처리한다.
+
 `search_docs`는 제공하지 않는다. 문서 검색이 필요하면 Agent Memory의 HTTP/MCP
 interface를 사용한다.
 

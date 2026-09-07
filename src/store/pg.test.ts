@@ -104,6 +104,35 @@ describe("PostgreSQL memory store", { skip }, () => {
     assert.ok(hit && Math.abs(hit.similarity - 1) < 1e-6);
   });
 
+  it("inserts concurrent repeats once and records each duplicate access", async () => {
+    const results = await Promise.all(Array.from({ length: 8 }, (_, i) =>
+      memories.putIfAbsent(memory({ id: `concurrent-${i}` }), [1, 0, 0]),
+    ));
+    assert.equal(results.filter((existing) => existing === undefined).length, 1);
+    assert.deepEqual(await memories.count("acme"), { project: 1 });
+    const [hit] = await memories.query("acme", [1, 0, 0], 1);
+    assert.equal(hit?.stats.accessCount, 7);
+  });
+
+  it("deduplicates only within the same tenant and storage scope", async () => {
+    const variants: Partial<StoredMemory>[] = [
+      {}, { tenantId: "other" },
+      { scope: "conversation", conversation: "chat:1" },
+      { scope: "conversation", conversation: "chat:2" },
+    ];
+    for (const [i, variant] of variants.entries()) {
+      assert.equal(await memories.putIfAbsent(memory({ id: `scope-${i}`, ...variant }), [1, 0, 0]), undefined);
+    }
+    const repeated = await memories.putIfAbsent(memory({ id: "repeat", conversation: "chat:1" }), [1, 0, 0]);
+    assert.equal(repeated?.id, "scope-0");
+    assert.deepEqual(await memories.count("acme", "chat:1"), { project: 2 });
+  });
+
+  it("releases a failed insertion transaction so it can be retried", async () => {
+    await assert.rejects(memories.putIfAbsent(memory(), []));
+    assert.equal(await memories.putIfAbsent(memory(), [1, 0, 0]), undefined);
+  });
+
   it("runs all five memory operations end to end", async () => {
     const service = new MemoryManager(memories, new FakeEmbedder(), 0.1);
     const stored = await service.remember("acme", {

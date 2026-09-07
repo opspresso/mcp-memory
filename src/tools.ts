@@ -83,8 +83,8 @@ export const TOOLS: readonly ToolDefinition[] = [
     description:
       "Store something worth knowing in a later session. Use it for durable facts — an " +
       "architectural decision and its reason, a convention this project follows, a command " +
-      "that turned out to be the right one. Content near-identical to something already " +
-      "stored is not written a second time: you are told which memory already says it, and " +
+      "that turned out to be the right one. Content identical to something already " +
+      "stored in the same scope is not written a second time: you are told which memory already says it, and " +
       "the tags and category you passed are discarded along with the rest. By default a " +
       "memory is the project's, seen by every conversation; pass scope \"conversation\" for " +
       "something that belongs to this thread alone — a preference the user stated here, a " +
