@@ -49,15 +49,15 @@ describe("HttpEmbedder", () => {
     assert.match(error.message, /clear or re-embed existing memories/);
   });
 
-  it("carries the provider's explanation through, bounded", async () => {
+  it("reports the HTTP status without reflecting the provider error body", async () => {
     const error = await embedder((async () =>
-      new Response("x".repeat(1000), { status: 401 })) as unknown as typeof fetch)
+      new Response("private memory echoed by the provider", { status: 401 })) as unknown as typeof fetch)
       .embed("hello")
       .catch((e: unknown) => e);
 
     assert.ok(error instanceof EmbeddingError);
-    assert.match(error.message, /answered 401/);
-    assert.ok(error.message.length < 300, "a stray error page must not land whole in a tool result");
+    assert.match(error.message, /HTTP 401/);
+    assert.doesNotMatch(error.message, /private memory/);
   });
 
   it("rejects a response with no embedding in it", async () => {
@@ -188,7 +188,7 @@ describe("BedrockEmbedder", () => {
 
   it("carries a Bedrock failure through as an embedding error", async () => {
     const error = await bedrock(async () => {
-      throw new Error("AccessDeniedException: no model access");
+      throw Object.assign(new Error("private memory echoed by Bedrock"), { name: "AccessDeniedException" });
     })
       .embed("hello")
       .catch((e: unknown) => e);
@@ -196,5 +196,6 @@ describe("BedrockEmbedder", () => {
     assert.ok(error instanceof EmbeddingError);
     assert.match(error.message, /Bedrock could not embed the text/);
     assert.match(error.message, /AccessDeniedException/);
+    assert.doesNotMatch(error.message, /private memory/);
   });
 });

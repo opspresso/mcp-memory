@@ -105,16 +105,13 @@ export class HttpEmbedder implements Embedder {
         if (name === "TimeoutError" || name === "AbortError") {
           throw new EmbeddingError(`the embedding service did not respond within ${timeout}ms`);
         }
-        throw new EmbeddingError(
-          `could not reach the embedding service — ${error instanceof Error ? error.message : String(error)}`,
-        );
+        throw new EmbeddingError("could not reach the embedding service", { cause: error });
       }
 
       if (!response.ok) {
-        const detail = (await response.text()).slice(0, 200);
-        throw new EmbeddingError(
-          `the embedding service answered ${response.status}${detail ? `: ${detail}` : ""}`,
-        );
+        // Provider error bodies can echo the input; they must not enter tool logs.
+        await response.body?.cancel();
+        throw new EmbeddingError(`the embedding service answered HTTP ${response.status}`);
       }
 
       let payload: unknown;
@@ -171,9 +168,13 @@ export class BedrockEmbedder implements Embedder {
       if (error instanceof EmbeddingError) {
         throw error;
       }
-      throw new EmbeddingError(
-        `Bedrock could not embed the text — ${error instanceof Error ? error.message : String(error)}`,
-      );
+      const knownErrors = [
+        "AccessDeniedException", "ThrottlingException", "ValidationException",
+        "ResourceNotFoundException", "ModelNotReadyException", "ModelTimeoutException",
+        "ServiceUnavailableException", "InternalServerException", "CredentialsProviderError",
+      ];
+      const kind = error instanceof Error && knownErrors.includes(error.name) ? ` (${error.name})` : "";
+      throw new EmbeddingError(`Bedrock could not embed the text${kind}`, { cause: error });
     }
     const embedding = (payload as { embedding?: unknown } | undefined)?.embedding;
     return validate(embedding, this.options.dimension, this.options.model);
