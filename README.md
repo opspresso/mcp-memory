@@ -14,6 +14,12 @@ Agent Studio의 실행이 끝난 뒤에도 프로젝트 결정과 대화 메모�
 | `forget(id)` | 현재 프로젝트의 메모리를 삭제한다 |
 | `memory_stats()` | 볼 수 있는 메모리를 유형별로 정확히 집계한다 |
 
+`remember`는 같은 tenant와 scope(대화 scope이면 같은 conversation)에서 본문이 완전히
+같을 때만 중복으로 처리한다. 중복 요청은 기존 메모리의 사용 횟수를 늘리고 기존 id를
+반환하며, 새 tags와 category는 반영하지 않는다. 숫자·부정어·문장 순서가 다른 본문은
+유사도가 높아도 별도로 저장한다. 동시 요청의 중복 판정과 저장은 하나의 DB transaction으로
+처리한다.
+
 `search_docs`는 제공하지 않는다. 문서 검색이 필요하면 Agent Memory의 HTTP/MCP
 interface를 사용한다.
 
@@ -29,9 +35,11 @@ interface를 사용한다.
 - recall 횟수와 마지막 recall 시각
 
 목록은 `created_at` index, 통계는 SQL `GROUP BY`, 사용 횟수는 atomic `UPDATE`로 처리한다.
-별도 object index, counter shard, flush timer는 없다. 벡터 열은 차원을 고정하지 않아 다른
-차원의 모델로 새 database를 시작할 수 있지만, 한 database 안에서 embedding 차원을 섞을
-수는 없다. 모델을 바꾸면 기존 메모리를 비우거나 전부 다시 embedding해야 한다.
+별도 object index, counter shard, flush timer는 없다. 벡터 열은 `EMBEDDING_DIM`에 맞춰
+차원을 고정해 다른 차원의 데이터가 섞이지 않도록 한다. 기존의 차원 제한 없는 열도 시작 시
+변환하며, 기존 데이터의 차원이 설정과 다르면 데이터를 보존하고 시작을 거부한다. 모델을
+바꾸면 기존 메모리를 비우거나 전부 다시 embedding해야 한다. 열 차원을 처음 설정하거나
+변경할 때는 테이블 잠금과 기존 데이터 검증이 발생한다.
 
 서버가 시작될 때 schema를 멱등하게 생성한다. v0.8의 `metadata`/`objects` schema를 발견하면
 기존 테이블을 삭제하고 현재 schema를 만든다. 개발 단계의 의도적인 파괴적 전환이며 기존
@@ -48,13 +56,13 @@ S3 또는 PostgreSQL 데이터 migration은 제공하지 않는다.
 | 변수 | 기본값 | 설명 |
 | --- | --- | --- |
 | `DATABASE_URL` | 없음 | 필수 PostgreSQL connection URL |
-| `PORT` | `3000` | HTTP listen port |
+| `PORT` | `3000` | HTTP listen port (`1–65535`) |
 | `MCP_API_KEY` | 없음 | 설정하면 `Authorization: Bearer …`를 요구한다 |
 | `EMBEDDING_PROVIDER` | `bedrock` | `bedrock` 또는 `openai` |
-| `EMBEDDING_BASE_URL` | 없음 | OpenAI-compatible endpoint의 `/v1` base URL |
+| `EMBEDDING_BASE_URL` | 없음 | HTTP(S) `/v1` base URL. credentials, query, fragment는 허용하지 않는다 |
 | `EMBEDDING_API_KEY` | 없음 | OpenAI-compatible endpoint key |
 | `EMBEDDING_MODEL` | provider 기본값 | 전송할 embedding model id |
-| `EMBEDDING_DIM` | Bedrock `1024`, OpenAI `1536` | 응답 vector 차원 |
+| `EMBEDDING_DIM` | Bedrock `1024`, OpenAI `1536` | 응답 vector 차원 (`1–16000`) |
 | `AWS_REGION` | `ap-northeast-2` | Bedrock을 사용할 때의 region |
 | `RECALL_MIN_SIMILARITY` | `0.1` | 무관한 후보를 제거하는 cosine 하한 `(0, 1]` |
 
@@ -92,6 +100,9 @@ npm test
 npm run build
 TEST_DATABASE_URL=postgres://mcp_memory:mcp_memory@127.0.0.1:5434/mcp_memory npm test
 ```
+
+통합 테스트는 실행마다 임시 schema를 만들고 종료 시 해당 schema만 삭제한다.
+연결 계정에 schema 생성 권한이 필요하며, pgvector extension이 없으면 설치를 시도한다.
 
 ## 실행과 health check
 

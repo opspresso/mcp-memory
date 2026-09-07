@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import { describe, it } from "node:test";
 import { BedrockEmbedder, EmbeddingError, HttpEmbedder } from "./embeddings.js";
 
@@ -47,15 +49,15 @@ describe("HttpEmbedder", () => {
     assert.match(error.message, /clear or re-embed existing memories/);
   });
 
-  it("carries the provider's explanation through, bounded", async () => {
+  it("reports the HTTP status without reflecting the provider error body", async () => {
     const error = await embedder((async () =>
-      new Response("x".repeat(1000), { status: 401 })) as unknown as typeof fetch)
+      new Response("private memory echoed by the provider", { status: 401 })) as unknown as typeof fetch)
       .embed("hello")
       .catch((e: unknown) => e);
 
     assert.ok(error instanceof EmbeddingError);
-    assert.match(error.message, /answered 401/);
-    assert.ok(error.message.length < 300, "a stray error page must not land whole in a tool result");
+    assert.match(error.message, /HTTP 401/);
+    assert.doesNotMatch(error.message, /private memory/);
   });
 
   it("rejects a response with no embedding in it", async () => {
@@ -76,6 +78,31 @@ describe("HttpEmbedder", () => {
 
     assert.ok(error instanceof EmbeddingError);
     assert.match(error.message, /all-zero/);
+  });
+
+  it("rejects JSON numbers that overflow to infinity", async () => {
+    await assert.rejects(
+      embedder((async () => new Response('{"data":[{"embedding":[1e400,0,1]}]}')) as typeof fetch)
+        .embed("hello"),
+      /non-finite vector component/,
+    );
+  });
+
+  it("times out while reading an unfinished response body", async () => {
+    const server = createServer((_request, response) => {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.write('{"data":[');
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    try {
+      await assert.rejects(new HttpEmbedder({
+        baseUrl: `http://127.0.0.1:${(server.address() as AddressInfo).port}`,
+        apiKey: "k", model: "test", dimension: 3, timeoutMs: 50,
+      }).embed("hello"), /did not respond within 50ms/);
+    } finally {
+      server.closeAllConnections();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
   });
 
   it("reports a timeout as a timeout", async () => {
@@ -137,9 +164,31 @@ describe("BedrockEmbedder", () => {
     assert.match(error.message, /all-zero/);
   });
 
+  it("rejects non-finite components before they reach PostgreSQL", async () => {
+    for (const value of [NaN, Infinity, -Infinity]) {
+      await assert.rejects(
+        bedrock(async () => ({ embedding: [value, 0, 1] })).embed("hello"),
+        /non-finite vector component/,
+      );
+    }
+  });
+
+  it("bounds the entire invocation and signals cancellation", async () => {
+    let signal: AbortSignal | undefined;
+    const instance = new BedrockEmbedder({
+      model: "test", dimension: 3, timeoutMs: 20,
+      invoke: async (_body, _model, received) => {
+        signal = received;
+        return new Promise(() => {});
+      },
+    });
+    await assert.rejects(instance.embed("hello"), /did not respond within 20ms/);
+    assert.equal(signal?.aborted, true);
+  });
+
   it("carries a Bedrock failure through as an embedding error", async () => {
     const error = await bedrock(async () => {
-      throw new Error("AccessDeniedException: no model access");
+      throw Object.assign(new Error("private memory echoed by Bedrock"), { name: "AccessDeniedException" });
     })
       .embed("hello")
       .catch((e: unknown) => e);
@@ -147,5 +196,6 @@ describe("BedrockEmbedder", () => {
     assert.ok(error instanceof EmbeddingError);
     assert.match(error.message, /Bedrock could not embed the text/);
     assert.match(error.message, /AccessDeniedException/);
+    assert.doesNotMatch(error.message, /private memory/);
   });
 });

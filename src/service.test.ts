@@ -109,7 +109,6 @@ describe("conversation scope", () => {
   it("fills a listing past another thread's notes rather than returning fewer than asked", async () => {
     // Twenty-five of someone else's notes sit newest on the index; a listing of
     // ten for a third party still finds its ten project memories behind them.
-    // Distinct sentences, or dedup merges them: the fake embedder scores by words.
     const facts = [
       "Deploys go through ArgoCD",
       "Readiness probes answer during drain",
@@ -157,6 +156,14 @@ describe("conversation scope", () => {
     assert.match(stored, /Stored as/);
   });
 
+  it("can share a thread note with the project from that same thread", async () => {
+    const content = "Prefer bullet points";
+    await remember(content, { scope: "conversation", conversation: THREAD });
+    assert.match(await remember(content, { conversation: THREAD }), /Stored as/);
+    assert.equal(vectors.size, 2);
+    assert.match(await service.list("alpha", { limit: 20, conversation: OTHER }), /Prefer bullet points/);
+  });
+
   it("forgets a conversation memory by id like any other", async () => {
     const result = await remember("Temporary note", { scope: "conversation", conversation: THREAD });
     const id = /Stored as ([0-9A-Z]{26})/.exec(result)![1]!;
@@ -190,12 +197,7 @@ describe("remember", () => {
     assert.equal(vectors.size, 2);
   });
 
-  it("finds the nearest neighbour rather than taking whichever came back first", async () => {
-    // `MemoryStore.query` promises the nearest neighbours and no order at all,
-    // and dedup is the one caller whose wrong pick is silent: it compares
-    // against a hit that is not the closest, sees nothing near enough, and
-    // writes a second copy of a fact already stored. Several unrelated
-    // memories first, so the duplicate is not the only thing to find.
+  it("finds an exact repeat among unrelated memories", async () => {
     await remember("Readiness probes point at slash health on port three thousand");
     await remember("Nightly backups land in the archive bucket every Sunday");
     await remember("The deploy pipeline pushes to ECR then dispatches to ArgoCD");
@@ -208,7 +210,7 @@ describe("remember", () => {
 
 });
 
-describe("dedup does not act on the cosine alone", () => {
+describe("dedup uses exact content equality", () => {
   /**
    * A model with no discrimination at all: every text lands on the same vector,
    * so every pair scores 1.0. Stands in for one whose similarities are
@@ -235,8 +237,28 @@ describe("dedup does not act on the cosine alone", () => {
     assert.equal(vectors.size, 2);
   });
 
+  it("preserves changed numbers, negation, punctuation and word order", async () => {
+    const facts = [
+      "Set the timeout to 10 seconds", "Set the timeout to 20 seconds",
+      "Deploy to production", "Do not deploy to production",
+      "Use x < y", "Use x > y",
+      "Alice reports to Bob", "Bob reports to Alice",
+    ];
+    for (const content of facts) {
+      assert.match(await store(content), /Stored as/);
+    }
+    assert.equal(vectors.size, facts.length);
+  });
+
+  it("finds an exact repeat beyond any vector candidate limit", async () => {
+    for (let i = 0; i < 10; i++) {
+      await store(`Use timeout ${i}`);
+    }
+    assert.match(await store("Use timeout 9"), /Already known/);
+    assert.equal(vectors.size, 10);
+  });
+
   it("still merges a genuine repeat under that same model", async () => {
-    // The guard must narrow dedup, not switch it off.
     const content = "The deploy pipeline pushes to ECR then dispatches to ArgoCD";
     await store(content);
     clock += 1000;
@@ -245,12 +267,7 @@ describe("dedup does not act on the cosine alone", () => {
     assert.equal(vectors.size, 1);
   });
 
-  it("reads Korean wording rather than scoring it zero", async () => {
-    // An ASCII-only split would empty every Korean text, score every pair at
-    // zero overlap, and silently switch dedup off for the content this
-    // deployment mostly holds. No Latin or digits in these on purpose: a
-    // stray "ECR" or "503" would carry the signal through such a split and
-    // leave the bug invisible.
+  it("compares Korean content exactly", async () => {
     const content = "배포 파이프라인은 이미지를 밀어 올린 뒤 클러스터에 전달한다";
     await store(content);
     clock += 1000;
@@ -423,6 +440,7 @@ describe("recall does not assume the store sorts", () => {
     const backing = new InMemoryMemoryStore();
     const reversing: MemoryStore = {
       put: (memory, embedding) => backing.put(memory, embedding),
+      putIfAbsent: (memory, embedding) => backing.putIfAbsent(memory, embedding),
       get: (t, ids) => backing.get(t, ids),
       delete: (t, ids) => backing.delete(t, ids),
       query: async (t, embedding, topK, conversation) =>
@@ -477,8 +495,6 @@ describe("list", () => {
   });
 
   it("honours the limit", async () => {
-    // No shared boilerplate between these: to the fake embedder, five sentences
-    // differing only in a number are one memory, and it would dedup them.
     const facts = [
       "Ingress terminates TLS at the shared gateway",
       "Cost dashboards aggregate spend per project daily",

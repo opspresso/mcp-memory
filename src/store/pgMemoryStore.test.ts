@@ -15,6 +15,7 @@ function stub(answers: { rows?: Record<string, unknown>[]; rowCount?: number }[]
   const sent: Sent[] = [];
   let next = 0;
   const db: Queryable = {
+    connect: async () => ({ query: db.query, release: () => {} }),
     query: async (text, values = []) => {
       sent.push({ text, values });
       const answer = answers[next++] ?? {};

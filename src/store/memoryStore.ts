@@ -30,6 +30,8 @@ export type MemoryCounts = Partial<Record<MemoryType, number>>;
 
 export interface MemoryStore {
   put(memory: StoredMemory, embedding: number[]): Promise<void>;
+  /** Insert once per tenant, scope and exact content; touch and return an existing copy. */
+  putIfAbsent(memory: StoredMemory, embedding: number[]): Promise<StoredMemory | undefined>;
   /** Nearest visible neighbours within one tenant. No result ordering is promised. */
   query(
     tenantId: string,

@@ -52,7 +52,7 @@ try {
 // Before the port is bound, like the configuration: a database this process
 // cannot reach, or a schema it may not create, is a failed boot and not a
 // pod that answers the health probe and fails every tool call.
-const store = await openPgStore(config.databaseUrl).catch((error: unknown) => {
+const store = await openPgStore(config.databaseUrl, config.embedding.dimension).catch((error: unknown) => {
   console.error(`storage error: ${describeError(error)}`);
   return process.exit(1);
 });
@@ -90,14 +90,8 @@ server.listen(config.port, () => {
 
 const leave = gracefulShutdown(server, {
   graceMs: SHUTDOWN_GRACE_MS,
-  // Pool shutdown never stands between the process and its exit: a connection
-  // that will not close is not worth another grace period.
-  exit: (code) => {
-    void store
-      .close()
-      .catch(() => {})
-      .finally(() => process.exit(code));
-  },
+  cleanup: () => store.close(),
+  exit: (code) => process.exit(code),
 });
 for (const signal of ["SIGTERM", "SIGINT"] as const) {
   process.on(signal, leave);

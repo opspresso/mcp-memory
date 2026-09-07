@@ -32,8 +32,7 @@ const DAY_MS = 86_400_000;
  * 1024d), a correct answer scores 0.15–0.41 and an unrelated one scores under
  * 0.05 — so a threshold tuned for a model whose correct answers sit at 0.8
  * silently returns nothing at all. Ratios survive the swap; absolute numbers do
- * not, and the one absolute number left *in ranking* is isolated in
- * `RECALL_MIN_SIMILARITY`. Dedup keeps one of its own — see `service.ts`.
+ * not, so the absolute relevance floor is isolated in `RECALL_MIN_SIMILARITY`.
  */
 interface ModeConfig {
   keepRatio: number;

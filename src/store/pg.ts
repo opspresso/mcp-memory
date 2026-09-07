@@ -47,7 +47,10 @@ export interface SchemaPool {
  * second table. This development-only breaking release intentionally discards
  * that layout instead of carrying a migration or compatibility path.
  */
-export async function ensureSchema(pool: SchemaPool): Promise<void> {
+export async function ensureSchema(pool: SchemaPool, dimension: number): Promise<void> {
+  if (!Number.isInteger(dimension) || dimension < 1 || dimension > 16_000) {
+    throw new SchemaError("embedding dimension must be an integer between 1 and 16000");
+  }
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
@@ -81,6 +84,24 @@ export async function ensureSchema(pool: SchemaPool): Promise<void> {
       for (const statement of SCHEMA) {
         await client.query(statement);
       }
+      const { rows: columns } = await client.query(
+        "SELECT atttypmod AS dimension FROM pg_attribute " +
+          "WHERE attrelid = 'memories'::regclass AND attname = 'embedding' AND NOT attisdropped",
+      );
+      if (columns[0]?.dimension !== dimension) {
+        try {
+          await client.query(`ALTER TABLE memories ALTER COLUMN embedding TYPE vector(${dimension})`);
+        } catch (error) {
+          if (!(error instanceof Error) || !("code" in error) || error.code !== "22000") {
+            throw error;
+          }
+          throw new SchemaError(
+            `could not set the embedding column to ${dimension} dimensions — verify EMBEDDING_DIM ` +
+              "matches existing memories; clear or re-embed them before changing dimensions",
+            { cause: error },
+          );
+        }
+      }
       await client.query("COMMIT");
     } catch (error) {
       await client.query("ROLLBACK").catch(() => {});
@@ -105,28 +126,27 @@ export interface PgStore {
   close(): Promise<void>;
 }
 
-function redact(databaseUrl: string): string {
+export function databaseAddress(databaseUrl: string): string {
   try {
     const url = new URL(databaseUrl);
-    url.password = "";
-    return url.toString();
+    return `${url.host}${url.pathname}`;
   } catch {
     return "<database url>";
   }
 }
 
-export async function openPgStore(databaseUrl: string): Promise<PgStore> {
+export async function openPgStore(databaseUrl: string, dimension: number): Promise<PgStore> {
   const pool = new pg.Pool({ connectionString: databaseUrl });
   reportIdleFailures(pool);
   try {
-    await ensureSchema(pool);
+    await ensureSchema(pool, dimension);
   } catch (error) {
     await pool.end().catch(() => {});
     throw error;
   }
   return {
     memories: new PgMemoryStore(pool),
-    description: `store: postgres at ${redact(databaseUrl)}`,
+    description: `store: postgres at ${databaseAddress(databaseUrl)}`,
     close: () => pool.end(),
   };
 }

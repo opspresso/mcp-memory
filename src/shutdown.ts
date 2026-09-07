@@ -7,6 +7,7 @@ export interface Closable {
 export interface ShutdownOptions {
   graceMs: number;
   exit: (code: number) => void;
+  cleanup?: () => Promise<void>;
   setTimer?: (handler: () => void, ms: number) => { unref?: () => void };
 }
 
@@ -32,6 +33,15 @@ export function gracefulShutdown(server: Closable, options: ShutdownOptions): ()
 
     const timer = setTimer(exit, options.graceMs);
     timer.unref?.();
-    server.close(exit);
+    server.close(() => {
+      if (exited) {
+        return;
+      }
+      if (!options.cleanup) {
+        exit();
+        return;
+      }
+      void Promise.resolve().then(options.cleanup).then(exit, exit);
+    });
   };
 }

@@ -74,4 +74,47 @@ describe("gracefulShutdown", () => {
     await new Promise((resolve) => setTimeout(resolve, 10));
     assert.equal(exits, 1);
   });
+
+  it("waits for cleanup after requests drain", async () => {
+    let finish!: () => void;
+    const cleanup = new Promise<void>((resolve) => { finish = resolve; });
+    let exits = 0;
+    gracefulShutdown(serverThat(true), {
+      graceMs: 10_000,
+      cleanup: () => cleanup,
+      exit: () => { exits += 1; },
+      setTimer: holdingTimer,
+    })();
+    await Promise.resolve();
+    assert.equal(exits, 0);
+    finish();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(exits, 1);
+  });
+
+  it("enforces the deadline even when cleanup never finishes", async () => {
+    const code = await new Promise<number>((resolve) => {
+      gracefulShutdown(serverThat(true), {
+        graceMs: 20,
+        cleanup: () => new Promise(() => {}),
+        exit: resolve,
+        setTimer: holdingTimer,
+      })();
+    });
+    assert.equal(code, 0);
+  });
+
+  it("exits when cleanup rejects or throws", async () => {
+    for (const cleanup of [
+      () => Promise.reject(new Error("close failed")),
+      () => { throw new Error("close failed"); },
+    ]) {
+      assert.equal(await new Promise<number>((resolve) => {
+        gracefulShutdown(serverThat(true), {
+          graceMs: 10_000, cleanup, exit: resolve, setTimer: holdingTimer,
+        })();
+      }), 0);
+    }
+  });
+
 });

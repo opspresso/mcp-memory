@@ -26,6 +26,27 @@ describe("loadConfig", () => {
     assert.ok(!("knowledgeBaseId" in config));
   });
 
+  it("rejects invalid ports before opening storage", () => {
+    for (const port of ["0", "65536", "1.5", "Infinity"]) {
+      assert.throws(() => loadConfig({ ...MINIMAL, PORT: port }), /PORT must be an integer/);
+    }
+    assert.equal(loadConfig({ ...MINIMAL, PORT: "65535" }).port, 65535);
+  });
+
+  it("validates and normalizes the HTTP embedding base URL", () => {
+    const env = { ...MINIMAL, EMBEDDING_PROVIDER: "openai", EMBEDDING_API_KEY: "k" };
+    for (const url of ["not-a-url", "file:///tmp/model", "https://llm/v1?key=private", "https://llm/v1#x", "https://user:private@llm/v1"]) {
+      assert.throws(() => loadConfig({ ...env, EMBEDDING_BASE_URL: url }), (error: unknown) => {
+        assert.ok(error instanceof ConfigError);
+        assert.doesNotMatch(error.message, /private/);
+        return true;
+      });
+    }
+    const config = loadConfig({ ...env, EMBEDDING_BASE_URL: "https://llm.example/v1///" });
+    assert.ok(config.embedding.provider === "openai");
+    assert.equal(config.embedding.baseUrl, "https://llm.example/v1");
+  });
+
   it("defaults to Bedrock, which needs no key", () => {
     const config = loadConfig(MINIMAL);
     assert.equal(config.embedding.provider, "bedrock");

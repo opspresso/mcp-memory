@@ -10,6 +10,10 @@ import {
 } from "./memoryStore.js";
 
 export interface Queryable {
+  connect(): Promise<{
+    query: Queryable["query"];
+    release(): void;
+  }>;
   query(
     text: string,
     values?: unknown[],
@@ -100,6 +104,42 @@ export class PgMemoryStore implements MemoryStore {
         toVectorLiteral(embedding),
       ],
     );
+  }
+
+  async putIfAbsent(memory: StoredMemory, embedding: number[]): Promise<StoredMemory | undefined> {
+    assertWithinContentBudget(memory);
+    const client = await this.db.connect();
+    try {
+      await client.query("BEGIN ISOLATION LEVEL READ COMMITTED");
+      try {
+        // The next statement gets a fresh READ COMMITTED snapshot after the lock.
+        // Hash collisions only serialize unrelated writes; equality is checked below.
+        await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
+          JSON.stringify([memory.tenantId, memory.scope ?? "project",
+            memory.scope === "conversation" ? memory.conversation : null, memory.content]),
+        ]);
+        const { rows } = await client.query(
+          `SELECT ${COLUMNS} FROM memories WHERE tenant_id = $1 AND content = $2 ` +
+            `AND scope = $3 AND ($3 = 'project' OR conversation = $4) ` +
+            `ORDER BY created_at, id LIMIT 1 FOR UPDATE`,
+          [memory.tenantId, memory.content, memory.scope ?? "project", memory.conversation ?? null],
+        );
+        const existing = rows[0] ? readMemory(rows[0]) : undefined;
+        const store = new PgMemoryStore({ connect: () => this.db.connect(), query: client.query.bind(client) });
+        if (existing) {
+          await store.touch(memory.tenantId, [existing.id], memory.createdAt);
+        } else {
+          await store.put(memory, embedding);
+        }
+        await client.query("COMMIT");
+        return existing;
+      } catch (error) {
+        await client.query("ROLLBACK").catch(() => {});
+        throw error;
+      }
+    } finally {
+      client.release();
+    }
   }
 
   async query(
