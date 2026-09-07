@@ -90,14 +90,8 @@ server.listen(config.port, () => {
 
 const leave = gracefulShutdown(server, {
   graceMs: SHUTDOWN_GRACE_MS,
-  // Pool shutdown never stands between the process and its exit: a connection
-  // that will not close is not worth another grace period.
-  exit: (code) => {
-    void store
-      .close()
-      .catch(() => {})
-      .finally(() => process.exit(code));
-  },
+  cleanup: () => store.close(),
+  exit: (code) => process.exit(code),
 });
 for (const signal of ["SIGTERM", "SIGINT"] as const) {
   process.on(signal, leave);
