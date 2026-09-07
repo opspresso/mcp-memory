@@ -85,16 +85,29 @@ function ratio(env: NodeJS.ProcessEnv, name: string, fallback: number): number {
   return value;
 }
 
-function integer(env: NodeJS.ProcessEnv, name: string, fallback: number): number {
+function integer(env: NodeJS.ProcessEnv, name: string, fallback: number, max = Number.MAX_SAFE_INTEGER): number {
   const raw = env[name]?.trim();
   if (!raw) {
     return fallback;
   }
   const value = Number(raw);
-  if (!Number.isInteger(value) || value <= 0) {
-    throw new ConfigError(`${name} must be a positive integer, got "${raw}"`);
+  if (!Number.isSafeInteger(value) || value <= 0 || value > max) {
+    throw new ConfigError(`${name} must be an integer between 1 and ${max}, got "${raw}"`);
   }
   return value;
+}
+
+function embeddingBaseUrl(env: NodeJS.ProcessEnv): string {
+  const raw = required(env, "EMBEDDING_BASE_URL");
+  try {
+    const url = new URL(raw);
+    if (!["http:", "https:"].includes(url.protocol) || url.search || url.hash || url.username || url.password) {
+      throw new Error("invalid endpoint");
+    }
+    return url.toString().replace(/\/+$/, "");
+  } catch {
+    throw new ConfigError("EMBEDDING_BASE_URL must be an HTTP(S) base URL without credentials, query or fragment");
+  }
 }
 
 function loadEmbedding(env: NodeJS.ProcessEnv): EmbeddingConfig {
@@ -109,7 +122,7 @@ function loadEmbedding(env: NodeJS.ProcessEnv): EmbeddingConfig {
   if (provider === "openai") {
     return {
       provider,
-      baseUrl: required(env, "EMBEDDING_BASE_URL").replace(/\/+$/, ""),
+      baseUrl: embeddingBaseUrl(env),
       apiKey: required(env, "EMBEDDING_API_KEY"),
       model: env.EMBEDDING_MODEL?.trim() || DEFAULT_OPENAI_MODEL,
       dimension: integer(env, "EMBEDDING_DIM", DEFAULT_OPENAI_DIM),
@@ -120,7 +133,7 @@ function loadEmbedding(env: NodeJS.ProcessEnv): EmbeddingConfig {
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   return {
-    port: integer(env, "PORT", 3000),
+    port: integer(env, "PORT", 3000, 65535),
     apiKey: env.MCP_API_KEY?.trim() || undefined,
     region: env.AWS_REGION?.trim() || "ap-northeast-2",
     databaseUrl: required(env, "DATABASE_URL"),

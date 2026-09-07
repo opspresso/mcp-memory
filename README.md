@@ -54,10 +54,10 @@ S3 또는 PostgreSQL 데이터 migration은 제공하지 않는다.
 | 변수 | 기본값 | 설명 |
 | --- | --- | --- |
 | `DATABASE_URL` | 없음 | 필수 PostgreSQL connection URL |
-| `PORT` | `3000` | HTTP listen port |
+| `PORT` | `3000` | HTTP listen port (`1–65535`) |
 | `MCP_API_KEY` | 없음 | 설정하면 `Authorization: Bearer …`를 요구한다 |
 | `EMBEDDING_PROVIDER` | `bedrock` | `bedrock` 또는 `openai` |
-| `EMBEDDING_BASE_URL` | 없음 | OpenAI-compatible endpoint의 `/v1` base URL |
+| `EMBEDDING_BASE_URL` | 없음 | HTTP(S) `/v1` base URL. credentials, query, fragment는 허용하지 않는다 |
 | `EMBEDDING_API_KEY` | 없음 | OpenAI-compatible endpoint key |
 | `EMBEDDING_MODEL` | provider 기본값 | 전송할 embedding model id |
 | `EMBEDDING_DIM` | Bedrock `1024`, OpenAI `1536` | 응답 vector 차원 |
