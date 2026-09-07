@@ -78,6 +78,14 @@ describe("HttpEmbedder", () => {
     assert.match(error.message, /all-zero/);
   });
 
+  it("rejects JSON numbers that overflow to infinity", async () => {
+    await assert.rejects(
+      embedder((async () => new Response('{"data":[{"embedding":[1e400,0,1]}]}')) as typeof fetch)
+        .embed("hello"),
+      /non-finite vector component/,
+    );
+  });
+
   it("reports a timeout as a timeout", async () => {
     const error = await embedder((async () => {
       const abort = new Error("aborted");
@@ -135,6 +143,15 @@ describe("BedrockEmbedder", () => {
       .catch((e: unknown) => e);
     assert.ok(error instanceof EmbeddingError);
     assert.match(error.message, /all-zero/);
+  });
+
+  it("rejects non-finite components before they reach PostgreSQL", async () => {
+    for (const value of [NaN, Infinity, -Infinity]) {
+      await assert.rejects(
+        bedrock(async () => ({ embedding: [value, 0, 1] })).embed("hello"),
+        /non-finite vector component/,
+      );
+    }
   });
 
   it("carries a Bedrock failure through as an embedding error", async () => {

@@ -32,6 +32,9 @@ function validate(embedding: unknown, dimension: number, model: string): number[
   if (!Array.isArray(embedding) || embedding.some((n) => typeof n !== "number")) {
     throw new EmbeddingError("the embedding service returned a response with no embedding in it");
   }
+  if (embedding.some((n) => !Number.isFinite(n))) {
+    throw new EmbeddingError("the embedding service returned a non-finite vector component");
+  }
   if (embedding.length !== dimension) {
     throw new EmbeddingError(
       `model "${model}" returned ${embedding.length} dimensions but this deployment expects ` +
