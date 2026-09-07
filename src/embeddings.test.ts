@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import { describe, it } from "node:test";
 import { BedrockEmbedder, EmbeddingError, HttpEmbedder } from "./embeddings.js";
 
@@ -86,6 +88,23 @@ describe("HttpEmbedder", () => {
     );
   });
 
+  it("times out while reading an unfinished response body", async () => {
+    const server = createServer((_request, response) => {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.write('{"data":[');
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    try {
+      await assert.rejects(new HttpEmbedder({
+        baseUrl: `http://127.0.0.1:${(server.address() as AddressInfo).port}`,
+        apiKey: "k", model: "test", dimension: 3, timeoutMs: 50,
+      }).embed("hello"), /did not respond within 50ms/);
+    } finally {
+      server.closeAllConnections();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
   it("reports a timeout as a timeout", async () => {
     const error = await embedder((async () => {
       const abort = new Error("aborted");
@@ -152,6 +171,19 @@ describe("BedrockEmbedder", () => {
         /non-finite vector component/,
       );
     }
+  });
+
+  it("bounds the entire invocation and signals cancellation", async () => {
+    let signal: AbortSignal | undefined;
+    const instance = new BedrockEmbedder({
+      model: "test", dimension: 3, timeoutMs: 20,
+      invoke: async (_body, _model, received) => {
+        signal = received;
+        return new Promise(() => {});
+      },
+    });
+    await assert.rejects(instance.embed("hello"), /did not respond within 20ms/);
+    assert.equal(signal?.aborted, true);
   });
 
   it("carries a Bedrock failure through as an embedding error", async () => {

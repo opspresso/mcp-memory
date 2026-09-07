@@ -62,6 +62,25 @@ export interface EmbeddingOptions {
 /** On the critical path of every recall, so it fails rather than hangs. */
 const DEFAULT_TIMEOUT_MS = 10_000;
 
+async function withTimeout<T>(
+  run: (signal: AbortSignal) => Promise<T>,
+  timeoutMs = DEFAULT_TIMEOUT_MS,
+): Promise<T> {
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      reject(new EmbeddingError(`the embedding service did not respond within ${timeoutMs}ms`));
+      controller.abort();
+    }, timeoutMs);
+  });
+  try {
+    return await Promise.race([run(controller.signal), deadline]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 export class HttpEmbedder implements Embedder {
   constructor(private readonly options: EmbeddingOptions) {}
 
@@ -69,41 +88,48 @@ export class HttpEmbedder implements Embedder {
     const doFetch = this.options.fetchImpl ?? fetch;
     const timeout = this.options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 
-    let response: Response;
-    try {
-      response = await doFetch(`${this.options.baseUrl}/embeddings`, {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          authorization: `Bearer ${this.options.apiKey}`,
-        },
-        body: JSON.stringify({ model: this.options.model, input: text }),
-        signal: AbortSignal.timeout(timeout),
-      });
-    } catch (error) {
-      const name = (error as Error)?.name;
-      if (name === "TimeoutError" || name === "AbortError") {
-        throw new EmbeddingError(`the embedding service did not respond within ${timeout}ms`);
+    return withTimeout(async (signal) => {
+      let response: Response;
+      try {
+        response = await doFetch(`${this.options.baseUrl}/embeddings`, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            authorization: `Bearer ${this.options.apiKey}`,
+          },
+          body: JSON.stringify({ model: this.options.model, input: text }),
+          signal,
+        });
+      } catch (error) {
+        const name = (error as Error)?.name;
+        if (name === "TimeoutError" || name === "AbortError") {
+          throw new EmbeddingError(`the embedding service did not respond within ${timeout}ms`);
+        }
+        throw new EmbeddingError(
+          `could not reach the embedding service — ${error instanceof Error ? error.message : String(error)}`,
+        );
       }
-      throw new EmbeddingError(
-        `could not reach the embedding service — ${error instanceof Error ? error.message : String(error)}`,
-      );
-    }
 
-    if (!response.ok) {
-      // The body may carry the provider's own explanation, which is usually the
-      // actionable part (a wrong model id, a rejected key). Bounded so a stray
-      // HTML error page cannot land in a tool result whole.
-      const detail = (await response.text().catch(() => "")).slice(0, 200);
-      throw new EmbeddingError(
-        `the embedding service answered ${response.status}${detail ? `: ${detail}` : ""}`,
-      );
-    }
+      if (!response.ok) {
+        const detail = (await response.text()).slice(0, 200);
+        throw new EmbeddingError(
+          `the embedding service answered ${response.status}${detail ? `: ${detail}` : ""}`,
+        );
+      }
 
-    const payload: unknown = await response.json().catch(() => undefined);
-    const embedding = (payload as { data?: { embedding?: unknown }[] } | undefined)?.data?.[0]
-      ?.embedding;
-    return validate(embedding, this.options.dimension, this.options.model);
+      let payload: unknown;
+      try {
+        payload = await response.json();
+      } catch (error) {
+        if (!(error instanceof SyntaxError)) {
+          throw error;
+        }
+        throw new EmbeddingError("the embedding service returned invalid JSON");
+      }
+      const embedding = (payload as { data?: { embedding?: unknown }[] } | undefined)?.data?.[0]
+        ?.embedding;
+      return validate(embedding, this.options.dimension, this.options.model);
+    }, timeout);
   }
 }
 
@@ -119,7 +145,8 @@ export interface BedrockEmbeddingOptions {
   model: string;
   dimension: number;
   /** Injected in tests. */
-  invoke: (body: string, model: string) => Promise<unknown>;
+  invoke: (body: string, model: string, signal: AbortSignal) => Promise<unknown>;
+  timeoutMs?: number;
 }
 
 export class BedrockEmbedder implements Embedder {
@@ -128,7 +155,7 @@ export class BedrockEmbedder implements Embedder {
   async embed(text: string): Promise<number[]> {
     let payload: unknown;
     try {
-      payload = await this.options.invoke(
+      payload = await withTimeout((signal) => this.options.invoke(
         JSON.stringify({
           inputText: text,
           dimensions: this.options.dimension,
@@ -138,8 +165,12 @@ export class BedrockEmbedder implements Embedder {
           normalize: true,
         }),
         this.options.model,
-      );
+        signal,
+      ), this.options.timeoutMs);
     } catch (error) {
+      if (error instanceof EmbeddingError) {
+        throw error;
+      }
       throw new EmbeddingError(
         `Bedrock could not embed the text — ${error instanceof Error ? error.message : String(error)}`,
       );
@@ -159,13 +190,14 @@ export function bedrockInvoker(region: string): BedrockEmbeddingOptions["invoke"
   // nothing anybody wrote. Reached through the call instead, the same failure
   // arrives where it can be said in a sentence.
   let client: Promise<BedrockRuntimeClient> | undefined;
-  return async (body, model) => {
+  return async (body, model, signal) => {
     const { InvokeModelCommand } = await import("@aws-sdk/client-bedrock-runtime");
     const bedrock = await (client ??= import("@aws-sdk/client-bedrock-runtime").then(
       ({ BedrockRuntimeClient }) => new BedrockRuntimeClient({ region }),
     ));
     const response = await bedrock.send(
       new InvokeModelCommand({ modelId: model, body, contentType: "application/json" }),
+      { abortSignal: signal },
     );
     return JSON.parse(new TextDecoder().decode(response.body));
   };
