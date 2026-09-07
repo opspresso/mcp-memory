@@ -52,7 +52,7 @@ try {
 // Before the port is bound, like the configuration: a database this process
 // cannot reach, or a schema it may not create, is a failed boot and not a
 // pod that answers the health probe and fails every tool call.
-const store = await openPgStore(config.databaseUrl).catch((error: unknown) => {
+const store = await openPgStore(config.databaseUrl, config.embedding.dimension).catch((error: unknown) => {
   console.error(`storage error: ${describeError(error)}`);
   return process.exit(1);
 });

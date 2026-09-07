@@ -2,13 +2,16 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { databaseAddress, ensureSchema, type SchemaPool } from "./pg.js";
 
-function schemaPool(legacy: boolean) {
+function schemaPool(legacy: boolean, dimension = 3) {
   const statements: string[] = [];
   let released = false;
   const pool: SchemaPool = {
     connect: async () => ({
       query: async (text) => {
         statements.push(text);
+        if (text.includes("FROM pg_attribute")) {
+          return { rows: [{ dimension }] };
+        }
         if (text.includes("FROM pg_extension")) {
           return { rows: [{}] };
         }
@@ -28,7 +31,7 @@ function schemaPool(legacy: boolean) {
 describe("ensureSchema", () => {
   it("replaces the legacy S3-shaped tables once", async () => {
     const fake = schemaPool(true);
-    await ensureSchema(fake.pool);
+    await ensureSchema(fake.pool, 3);
 
     assert.ok(fake.statements.includes("DROP TABLE memories"));
     assert.ok(fake.statements.includes("DROP TABLE IF EXISTS objects"));
@@ -39,11 +42,26 @@ describe("ensureSchema", () => {
 
   it("leaves the current table intact", async () => {
     const fake = schemaPool(false);
-    await ensureSchema(fake.pool);
+    await ensureSchema(fake.pool, 3);
 
     assert.ok(!fake.statements.some((statement) => statement.startsWith("DROP TABLE")));
     assert.ok(fake.statements.some((statement) => statement.startsWith("CREATE TABLE IF NOT EXISTS memories")));
   });
+
+  it("does not alter the column again when its dimension already matches", async () => {
+    const fake = schemaPool(false);
+    await ensureSchema(fake.pool, 3);
+    assert.ok(!fake.statements.some((statement) => statement.startsWith("ALTER TABLE")));
+  });
+
+  it("rejects invalid dimensions before executing SQL", async () => {
+    const fake = schemaPool(false);
+    for (const dimension of [0, -1, 1.5, NaN, Infinity, 16001]) {
+      await assert.rejects(ensureSchema(fake.pool, dimension), /embedding dimension/);
+    }
+    assert.equal(fake.statements.length, 0);
+  });
+
 });
 
 

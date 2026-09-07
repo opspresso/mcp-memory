@@ -41,8 +41,8 @@ export interface Config {
 /**
  * Where embeddings come from.
  *
- * PostgreSQL stores a vector at whatever width it arrived with and refuses to
- * compare vectors whose dimensions differ. Changing models therefore requires
+ * PostgreSQL fixes the vector column to the configured width and refuses
+ * incompatible writes. Changing models therefore requires
  * clearing or re-embedding existing memories.
  */
 export type EmbeddingConfig =
@@ -116,7 +116,7 @@ function loadEmbedding(env: NodeJS.ProcessEnv): EmbeddingConfig {
     return {
       provider,
       model: env.EMBEDDING_MODEL?.trim() || DEFAULT_BEDROCK_MODEL,
-      dimension: integer(env, "EMBEDDING_DIM", DEFAULT_BEDROCK_DIM),
+      dimension: integer(env, "EMBEDDING_DIM", DEFAULT_BEDROCK_DIM, 16_000),
     };
   }
   if (provider === "openai") {
@@ -125,7 +125,7 @@ function loadEmbedding(env: NodeJS.ProcessEnv): EmbeddingConfig {
       baseUrl: embeddingBaseUrl(env),
       apiKey: required(env, "EMBEDDING_API_KEY"),
       model: env.EMBEDDING_MODEL?.trim() || DEFAULT_OPENAI_MODEL,
-      dimension: integer(env, "EMBEDDING_DIM", DEFAULT_OPENAI_DIM),
+      dimension: integer(env, "EMBEDDING_DIM", DEFAULT_OPENAI_DIM, 16_000),
     };
   }
   throw new ConfigError(`EMBEDDING_PROVIDER must be "bedrock" or "openai", got "${provider}"`);

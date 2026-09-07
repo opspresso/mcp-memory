@@ -35,9 +35,11 @@ interface를 사용한다.
 - recall 횟수와 마지막 recall 시각
 
 목록은 `created_at` index, 통계는 SQL `GROUP BY`, 사용 횟수는 atomic `UPDATE`로 처리한다.
-별도 object index, counter shard, flush timer는 없다. 벡터 열은 차원을 고정하지 않아 다른
-차원의 모델로 새 database를 시작할 수 있지만, 한 database 안에서 embedding 차원을 섞을
-수는 없다. 모델을 바꾸면 기존 메모리를 비우거나 전부 다시 embedding해야 한다.
+별도 object index, counter shard, flush timer는 없다. 벡터 열은 `EMBEDDING_DIM`에 맞춰
+차원을 고정해 다른 차원의 데이터가 섞이지 않도록 한다. 기존의 차원 제한 없는 열도 시작 시
+변환하며, 기존 데이터의 차원이 설정과 다르면 데이터를 보존하고 시작을 거부한다. 모델을
+바꾸면 기존 메모리를 비우거나 전부 다시 embedding해야 한다. 열 차원을 처음 설정하거나
+변경할 때는 테이블 잠금과 기존 데이터 검증이 발생한다.
 
 서버가 시작될 때 schema를 멱등하게 생성한다. v0.8의 `metadata`/`objects` schema를 발견하면
 기존 테이블을 삭제하고 현재 schema를 만든다. 개발 단계의 의도적인 파괴적 전환이며 기존
@@ -60,7 +62,7 @@ S3 또는 PostgreSQL 데이터 migration은 제공하지 않는다.
 | `EMBEDDING_BASE_URL` | 없음 | HTTP(S) `/v1` base URL. credentials, query, fragment는 허용하지 않는다 |
 | `EMBEDDING_API_KEY` | 없음 | OpenAI-compatible endpoint key |
 | `EMBEDDING_MODEL` | provider 기본값 | 전송할 embedding model id |
-| `EMBEDDING_DIM` | Bedrock `1024`, OpenAI `1536` | 응답 vector 차원 |
+| `EMBEDDING_DIM` | Bedrock `1024`, OpenAI `1536` | 응답 vector 차원 (`1–16000`) |
 | `AWS_REGION` | `ap-northeast-2` | Bedrock을 사용할 때의 region |
 | `RECALL_MIN_SIMILARITY` | `0.1` | 무관한 후보를 제거하는 cosine 하한 `(0, 1]` |
 

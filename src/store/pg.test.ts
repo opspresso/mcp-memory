@@ -42,12 +42,13 @@ describe("PostgreSQL memory store", { skip }, () => {
     pool = new pg.Pool({ connectionString: connection.toString() });
     const { rows } = await pool.query("SELECT current_schema() AS schema");
     assert.equal(rows[0]?.schema, schema);
-    await ensureSchema(pool);
+    await ensureSchema(pool, 3);
     memories = new PgMemoryStore(pool);
   });
 
   beforeEach(async () => {
     await pool.query("TRUNCATE memories");
+    await ensureSchema(pool, 3);
   });
 
   after(async () => {
@@ -62,7 +63,7 @@ describe("PostgreSQL memory store", { skip }, () => {
   });
 
   it("creates the relational schema idempotently", async () => {
-    await ensureSchema(pool);
+    await ensureSchema(pool, 3);
     const { rows } = await pool.query(
       "SELECT column_name FROM information_schema.columns " +
         "WHERE table_schema = current_schema() AND table_name = 'memories' ORDER BY ordinal_position",
@@ -114,11 +115,37 @@ describe("PostgreSQL memory store", { skip }, () => {
     assert.deepEqual(await memories.count("acme", "chat:1"), { project: 2 });
   });
 
-  it("accepts whatever width the embedding model produces", async () => {
+  it("supports a different configured width after memories are cleared", async () => {
+    await ensureSchema(pool, 1536);
     const wide = Array.from({ length: 1536 }, (_, i) => (i % 7) / 7);
     await memories.put(memory(), wide);
     const [hit] = await memories.query("acme", wide, 1);
     assert.ok(hit && Math.abs(hit.similarity - 1) < 1e-6);
+  });
+
+  it("rejects a new memory with incompatible dimensions without breaking recall", async () => {
+    await memories.putIfAbsent(memory(), [1, 0, 0]);
+    await assert.rejects(
+      memories.putIfAbsent(memory({ id: "incompatible", content: "A different fact" }), [1, 0]),
+      /dimensions/,
+    );
+    assert.deepEqual(await memories.count("acme"), { project: 1 });
+    assert.equal((await memories.query("acme", [1, 0, 0], 10)).length, 1);
+  });
+
+  it("constrains an existing untyped vector column without losing memories", async () => {
+    await pool.query("ALTER TABLE memories ALTER COLUMN embedding TYPE vector");
+    await memories.put(memory(), [1, 0, 0]);
+    await ensureSchema(pool, 3);
+    assert.equal((await memories.query("acme", [1, 0, 0], 10)).length, 1);
+    await assert.rejects(memories.put(memory({ id: "wrong-width" }), [1, 0]), /dimensions/);
+  });
+
+  it("fails startup and preserves data when existing dimensions do not match", async () => {
+    await pool.query("ALTER TABLE memories ALTER COLUMN embedding TYPE vector");
+    await memories.put(memory(), [1, 0]);
+    await assert.rejects(ensureSchema(pool, 3), /clear or re-embed/);
+    assert.equal((await memories.query("acme", [1, 0], 10)).length, 1);
   });
 
   it("inserts concurrent repeats once and records each duplicate access", async () => {
@@ -151,6 +178,7 @@ describe("PostgreSQL memory store", { skip }, () => {
   });
 
   it("runs all five memory operations end to end", async () => {
+    await ensureSchema(pool, 64);
     const service = new MemoryManager(memories, new FakeEmbedder(), 0.1);
     const stored = await service.remember("acme", {
       content: "The deploy pipeline pushes the image to ECR",
